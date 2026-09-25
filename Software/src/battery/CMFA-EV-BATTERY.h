@@ -238,12 +238,12 @@ class CmfaEvBattery : public UdsCanBattery {
   bool interlock_flag = false;
   uint16_t soc_z = 0;
   uint16_t soc_u = 0;
-  uint16_t max_regen_power = 0;
-  uint16_t max_discharge_power = 0;
+  uint32_t max_regen_power = 0;
+  uint32_t max_discharge_power = 0;
   int16_t average_temperature = 0;
   int16_t minimum_temperature = 0;
   int16_t maximum_temperature = 0;
-  uint16_t maximum_charge_power = 0;
+  uint32_t maximum_charge_power = 0;
   uint16_t SOH_available_power = 0;
   uint16_t SOH_generated_power = 0;
   uint32_t average_voltage_of_cells = 270000;

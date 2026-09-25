@@ -221,10 +221,10 @@ uint16_t CmfaEvBattery::handle_pid(uint16_t pid, uint32_t value, const uint8_t* 
       averaged_current_raw = value;
       break;
     case PID_POLL_MAX_REGEN:
-      max_regen_power = (uint16_t)value;
+      max_regen_power = value * 10;
       break;
     case PID_POLL_MAX_DISCHARGE_POWER:
-      max_discharge_power = (uint16_t)value;
+      max_discharge_power = value * 10;
       break;
     case PID_POLL_12V_BATTERY:
       lead_acid_voltage = (uint16_t)value;
@@ -239,7 +239,7 @@ uint16_t CmfaEvBattery::handle_pid(uint16_t pid, uint32_t value, const uint8_t* 
       maximum_temperature = (int16_t)(((int32_t)value - 400) / 2);
       break;
     case PID_POLL_MAX_CHARGE_POWER:
-      maximum_charge_power = (uint16_t)value;
+      maximum_charge_power = value * 10;
       break;
     case PID_POLL_END_OF_CHARGE_FLAG:
       end_of_charge = data[0];
