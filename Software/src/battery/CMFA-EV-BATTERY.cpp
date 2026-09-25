@@ -46,9 +46,9 @@ void CmfaEvBattery::
 
     datalayer_battery->status.max_discharge_power_W = datalayer.battery.status.override_discharge_power_W;
   } else {  //Use sane limits sent by battery
-    datalayer_battery->status.max_charge_power_W = charge_power_w;
+    datalayer_battery->status.max_charge_power_W = maximum_charge_power;
 
-    datalayer_battery->status.max_discharge_power_W = discharge_power_w;
+    datalayer_battery->status.max_discharge_power_W = max_discharge_power;
   }
 
   datalayer_battery->status.temperature_min_dC = (lowest_cell_temperature * 10);
@@ -346,13 +346,18 @@ uint16_t CmfaEvBattery::handle_pid(uint16_t pid, uint32_t value, const uint8_t* 
       break;
   }
 
-  // The instantaneous current changes quickly, so sample it every other PID by
-  // requesting it out-of-sequence next; the scan list then resumes where it
-  // left off when the instant current response comes back (which returns 0).
-  if (pid != PID_POLL_INSTANT_CURRENT) {
+  // Do current and power much more often than the regular scans
+  if (pid == PID_POLL_INSTANT_CURRENT) {
+    return PID_POLL_MAX_CHARGE_POWER;
+  } else if (pid == PID_POLL_MAX_CHARGE_POWER) {
+    return PID_POLL_MAX_DISCHARGE_POWER;
+  } else if (pid == PID_POLL_MAX_DISCHARGE_POWER) {
+    // Scan the next regular PID in the sequence
+    return 0;
+  } else {
+    // Current follows every regular PID
     return PID_POLL_INSTANT_CURRENT;
   }
-  return 0;  //Continue scanning the PID list in order
 }
 
 void CmfaEvBattery::enable_temporisation() {
@@ -487,8 +492,6 @@ void CmfaEvBattery::setup(void) {  // Performs one time setup at startup
       //PID_POLL_CURRENT_OFFSET,
       PID_POLL_100MS_CURRENT,
       PID_POLL_MAX_REGEN,
-      PID_POLL_MAX_DISCHARGE_POWER,
-      PID_POLL_MAX_CHARGE_POWER,
       PID_POLL_AVERAGE_TEMPERATURE,
       PID_POLL_MIN_TEMPERATURE,
       PID_POLL_MAX_TEMPERATURE,
