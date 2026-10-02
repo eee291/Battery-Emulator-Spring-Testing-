@@ -115,7 +115,8 @@ String CmfaEvBattery::get_uds_info_html() {
                 temporisation==1 ? "ACTIVE" : "INACTIVE"
              ) << "</h4>"
              "<h4>Pack time life: " << pack_time_life << "m (was " << int32_t(initial_pack_time_life) << "m)</h4>"
-             "<h4>Absolute time saved: " << absolute_time_saved << "m (was " << int32_t(initial_absolute_time_saved) << "m)</h4>";
+             "<h4>Absolute time saved: " << absolute_time_saved << "m (was " << int32_t(initial_absolute_time_saved) << "m)</h4>"
+             "<h4>Last NVROL/sleep sequence: " << sequence_status << "</h4>";
   // clang-format on
 
   return content;
@@ -127,6 +128,7 @@ void CmfaEvBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
     return;
   }
 
+  bool from_bms = true;
   switch (rx_frame.ID) {  //These frames are transmitted by the battery
     case 0x127:           //10ms , Same structure as old Zoe 0x155 message!
       datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
@@ -173,7 +175,18 @@ void CmfaEvBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
       datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
       break;
     default:
+      from_bms = false;
       break;
+  }
+
+  if (from_bms) {
+    last_bms_frame_ms = millis();
+    if (sleep_monitoring && bms_quiet) {
+      // The BMS has started talking again while it should be asleep.
+      bms_quiet = false;
+      bms_wakes = bms_wakes + 1;
+      logging.printf("[CMFA] BMS started transmitting again during sleep (0x%03X)\n", (unsigned)rx_frame.ID);
+    }
   }
 }
 
@@ -365,8 +378,13 @@ void CmfaEvBattery::enable_temporisation() {
 }
 
 void CmfaEvBattery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len) {
-  // Called by the superclass when a response in a UDS sequence is received.
-  // Timeouts are ignored for now: each step only advances on a response.
+  // Called by the superclass when a response in a UDS sequence is received
+  // (or a sequence/wait step starts, with sid 0). A negative response to any
+  // request aborts the sequence; timeouts arrive via on_uds_sequence_timeout().
+  if (sequence_step_rejected(state, sid, data, len)) {
+    return;
+  }
+
   switch (state) {
       // Temporisation sequence
 
@@ -387,6 +405,8 @@ void CmfaEvBattery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint
       // NVROL reset sequence
 
     case CMFA_STATE_NVROL_START:
+      snprintf(sequence_status, sizeof(sequence_status), "NVROL reset in progress");
+      logging.println("[CMFA] NVROL reset started");
       // NVROL reset, part 1: enter an extended diagnostic session (0x10 0x03).
       send_sequence_message(CMFA_STATE_NVROL_SESSION, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1,
                             CMFA_NVROL_TIMEOUT_TICKS, 1);
@@ -397,6 +417,7 @@ void CmfaEvBattery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint
                             CMFA_NVROL_TIMEOUT_TICKS, 2);
       break;
     case CMFA_STATE_NVROL_ROUTINE:
+      logging.println("[CMFA] NVROL reset routine accepted");
       // Enable temporisation before sleep, part 1: extended session again.
       send_sequence_message(CMFA_STATE_NVROL_SLEEP_SESSION, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1,
                             CMFA_NVROL_TIMEOUT_TICKS, 1);
@@ -409,13 +430,11 @@ void CmfaEvBattery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint
     case CMFA_STATE_NVROL_SLEEP_WRITE:
       // The temporisation write is done: stop streaming the awake byte on 0x1EA
       // so the pack saves its state and falls asleep, then hold the bus for 30 s.
-      CMFA_1EA.data.u8[0] = CMFA_1EA_SLEEP;
-      sequence_wait(CMFA_STATE_NVROL_SLEEP_WAIT, CMFA_SLEEP_TICKS);
+      start_sleep(CMFA_STATE_NVROL_SLEEP_WAIT);
       break;
     case CMFA_STATE_NVROL_SLEEP_WAIT:
       // Wake the pack back up. The sequence ends here (no further steps sent).
-      CMFA_1EA.data.u8[0] = CMFA_1EA_AWAKE;
-      logging.println("[CMFA] NVROL reset complete");
+      finish_sleep("NVROL reset");
       break;
 
       // Plain sleep sequence
@@ -423,13 +442,11 @@ void CmfaEvBattery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint
     case CMFA_STATE_SLEEP_START:
       // Put the pack to sleep (no diagnostic session or reset) and hold the
       // bus for 30 s while it saves its state and falls asleep.
-      CMFA_1EA.data.u8[0] = CMFA_1EA_SLEEP;
-      sequence_wait(CMFA_STATE_SLEEP_WAIT, CMFA_SLEEP_TICKS);
+      start_sleep(CMFA_STATE_SLEEP_WAIT);
       break;
     case CMFA_STATE_SLEEP_WAIT:
       // Wake the pack back up. The sequence ends here (no further steps sent).
-      CMFA_1EA.data.u8[0] = CMFA_1EA_AWAKE;
-      logging.println("[CMFA] Sleep cycle complete");
+      finish_sleep("Sleep cycle");
       break;
 
     default:
@@ -437,14 +454,105 @@ void CmfaEvBattery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint
   }
 }
 
+void CmfaEvBattery::on_uds_sequence_timeout(uint16_t state) {
+  // A sequence step got no response, even after retries. The superclass has
+  // already ended the sequence.
+  abort_sequence(state, "no response", 0);
+}
+
+bool CmfaEvBattery::sequence_step_rejected(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len) {
+  if (sid != kNegativeResponseSid) {
+    return false;
+  }
+  // Negative response: 7F <request SID> <NRC>. Don't send the next step, so
+  // the sequence ends here.
+  abort_sequence(state, "negative response", len >= 3 ? data[2] : 0);
+  return true;
+}
+
+void CmfaEvBattery::abort_sequence(uint16_t state, const char* reason, uint8_t nrc) {
+  // Never leave the pack being told to sleep.
+  CMFA_1EA.data.u8[0] = CMFA_1EA_AWAKE;
+  sleep_monitoring = false;
+
+  if (nrc) {
+    snprintf(sequence_status, sizeof(sequence_status), "FAILED at %s: %s (NRC 0x%02X)", sequence_step_name(state),
+             reason, nrc);
+  } else {
+    snprintf(sequence_status, sizeof(sequence_status), "FAILED at %s: %s", sequence_step_name(state), reason);
+  }
+  logging.printf("[CMFA] UDS sequence %s\n", sequence_status);
+}
+
+const char* CmfaEvBattery::sequence_step_name(uint16_t state) {
+  switch (state) {
+    case CMFA_STATE_TEMPORISATION_DIAG:
+      return "temporisation: extended session (10 03)";
+    case CMFA_STATE_TEMPORISATION_SEND:
+      return "temporisation: write 2E 92 81 01";
+    case CMFA_STATE_NVROL_SESSION:
+      return "NVROL: extended session (10 03)";
+    case CMFA_STATE_NVROL_ROUTINE:
+      return "NVROL: reset routine (31 01 B0 09)";
+    case CMFA_STATE_NVROL_SLEEP_SESSION:
+      return "NVROL: second extended session (10 03)";
+    case CMFA_STATE_NVROL_SLEEP_WRITE:
+      return "NVROL: write temporisation (2E 92 81 01)";
+    default:
+      return "unknown step";
+  }
+}
+
+void CmfaEvBattery::start_sleep(uint16_t wait_state) {
+  CMFA_1EA.data.u8[0] = CMFA_1EA_SLEEP;
+  sleep_request_ms = millis();
+  bms_quiet = false;
+  bms_wakes = 0;
+  bms_quiet_after_ms = 0;
+  sleep_frames_sent = 0;
+  sleep_monitoring = true;
+  logging.println("[CMFA] Asking pack to sleep, watching for BMS frames to stop");
+  // The sleep requests take ~100 ms (one tick) before we go silent, so add
+  // that on to keep the bus silent for the full 30 s.
+  sequence_wait(wait_state, CMFA_SLEEP_TICKS + 1);
+}
+
+void CmfaEvBattery::finish_sleep(const char* what) {
+  // Clearing sleep_monitoring also resumes CAN sending, with 0x1EA awake.
+  sleep_monitoring = false;
+  CMFA_1EA.data.u8[0] = CMFA_1EA_AWAKE;
+
+  if (bms_quiet) {
+    snprintf(sequence_status, sizeof(sequence_status), "%s OK: BMS went quiet %lums after sleep request%s", what,
+             bms_quiet_after_ms, bms_wakes ? " (after waking up again)" : "");
+  } else if (bms_wakes) {
+    snprintf(sequence_status, sizeof(sequence_status),
+             "%s FAILED: BMS went quiet but started transmitting again (%u times)", what, bms_wakes);
+  } else {
+    snprintf(sequence_status, sizeof(sequence_status), "%s FAILED: BMS never stopped transmitting - pack did not sleep",
+             what);
+  }
+  logging.printf("[CMFA] %s\n", sequence_status);
+}
+
 void CmfaEvBattery::transmit_can(unsigned long currentMillis) {
+  // While the pack is being put to sleep, we send a few 0x1EA sleep requests
+  // and then go completely silent until the wait ends, like a vehicle would.
+  const bool silenced = sleep_monitoring && sleep_frames_sent >= CMFA_SLEEP_FRAMES_BEFORE_SILENCE;
+
   // Send 10ms CAN Message
   if (currentMillis - previousMillis10ms >= INTERVAL_10_MS) {
     previousMillis10ms = currentMillis;
-    transmit_can_frame(&CMFA_1EA);
-    transmit_can_frame(&CMFA_135);
-    transmit_can_frame(&CMFA_134);
-    transmit_can_frame(&CMFA_125);
+    if (!silenced) {
+      transmit_can_frame(&CMFA_1EA);
+      transmit_can_frame(&CMFA_135);
+      transmit_can_frame(&CMFA_134);
+      transmit_can_frame(&CMFA_125);
+
+      if (sleep_monitoring && ++sleep_frames_sent >= CMFA_SLEEP_FRAMES_BEFORE_SILENCE) {
+        logging.printf("[CMFA] Sent %u sleep requests, stopping all CAN sending\n", sleep_frames_sent);
+      }
+    }
 
     CMFA_135.data.u8[1] = content_135[counter_10ms];
     CMFA_125.data.u8[3] = content_125[counter_10ms];
@@ -454,19 +562,29 @@ void CmfaEvBattery::transmit_can(unsigned long currentMillis) {
   if (currentMillis - previousMillis100ms >= INTERVAL_100_MS) {
     previousMillis100ms = currentMillis;
 
-    transmit_can_frame(&CMFA_59B);
-    transmit_can_frame(&CMFA_3D3);
+    if (!silenced) {
+      transmit_can_frame(&CMFA_59B);
+      transmit_can_frame(&CMFA_3D3);
+    }
+  }
+
+  // While the pack has been asked to sleep, detect its broadcast frames stopping.
+  if (sleep_monitoring && !bms_quiet && (long)(currentMillis - last_bms_frame_ms) >= (long)CMFA_SLEEP_QUIET_MS) {
+    bms_quiet = true;
+    // If the BMS was already silent before the request, count it as immediate.
+    bms_quiet_after_ms = (long)(last_bms_frame_ms - sleep_request_ms) > 0 ? last_bms_frame_ms - sleep_request_ms : 0;
+    logging.printf("[CMFA] BMS went quiet %lums after sleep request\n", bms_quiet_after_ms);
   }
 
   // Automatically enable temporisation if the BMS reports it as disabled.
   // Don't queue it while a UDS sequence (e.g. an NVROL reset) is in progress.
-  if (!uds_is_busy() && temporisation != 0xFF &&
-      currentMillis - previousMillisTemporisation >= TEMPORISATION_RETRY_MS) {
-    if (temporisation == 0) {
-      previousMillisTemporisation = currentMillis;
-      enable_temporisation();
-    }
-  }
+  // if (!uds_is_busy() && temporisation != 0xFF &&
+  //     currentMillis - previousMillisTemporisation >= TEMPORISATION_RETRY_MS) {
+  //   if (temporisation == 0) {
+  //     previousMillisTemporisation = currentMillis;
+  //     enable_temporisation();
+  //   }
+  // }
 
   // UDS PID polling and DTC handling
   transmit_uds_can(currentMillis);

@@ -28,6 +28,7 @@ class CmfaEvBattery : public UdsCanBattery {
   virtual void transmit_can(unsigned long currentMillis);
   virtual void enable_temporisation();
   virtual void on_uds_sequence_step(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len) override;
+  virtual void on_uds_sequence_timeout(uint16_t state) override;
   static constexpr const char* Name = "CMFA platform, 27 kWh battery";
 
   bool supports_reset_NVROL() { return true; }
@@ -56,19 +57,19 @@ class CmfaEvBattery : public UdsCanBattery {
 
     // NVROL reset sequence (ported from the Renault Zoe Gen2 integration).
     // After resetting the NVROL memory we enable "temporisation before sleep",
-    // then put the 0x1EA keep-alive frame to sleep for 30 s so the pack saves
-    // its state and falls asleep, and finally wake it back up.
+    // then send a few 0x1EA sleep requests and stop all CAN sending for 30 s so
+    // the pack saves its state and falls asleep, and finally wake it back up.
     CMFA_STATE_NVROL_START = 0x10,
     CMFA_STATE_NVROL_SESSION,        // 0x10 0x03 (extended diagnostic session)
     CMFA_STATE_NVROL_ROUTINE,        // 0x31 01 B0 09 (NVROL reset routine)
     CMFA_STATE_NVROL_SLEEP_SESSION,  // 0x10 0x03 (extended session, again)
     CMFA_STATE_NVROL_SLEEP_WRITE,    // 0x2E 92 81 01 (enable temporisation before sleep)
-    CMFA_STATE_NVROL_SLEEP_WAIT,     // 30 s: 0x1EA kept asleep so the pack falls asleep
+    CMFA_STATE_NVROL_SLEEP_WAIT,     // 30 s: CAN silent so the pack falls asleep
 
     // Plain sleep sequence: put the pack to sleep for 30 s and wake it again,
     // without any diagnostic session or NVROL reset.
     CMFA_STATE_SLEEP_START = 0x20,
-    CMFA_STATE_SLEEP_WAIT,  // 30 s: 0x1EA kept asleep so the pack falls asleep
+    CMFA_STATE_SLEEP_WAIT,  // 30 s: CAN silent so the pack falls asleep
   };
 
   // Timeouts for the UDS sequences (in UDS ticks).
@@ -81,6 +82,30 @@ class CmfaEvBattery : public UdsCanBattery {
   // to sleep, 0x00 keeps it awake.
   static constexpr uint8_t CMFA_1EA_AWAKE = 0x00;
   static constexpr uint8_t CMFA_1EA_SLEEP = 0x01;
+
+  // Sequence error handling: a negative response or a timeout aborts the
+  // sequence, wakes the pack back up and records why in sequence_status.
+  bool sequence_step_rejected(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len);
+  void abort_sequence(uint16_t state, const char* reason, uint8_t nrc);
+  static const char* sequence_step_name(uint16_t state);
+
+  // Sleep detection: while the pack has been asked to sleep, watch for the
+  // BMS's own broadcast frames stopping. If they don't stop, the pack never
+  // went through a controlled shutdown (and an NVROL reset won't be saved).
+  void start_sleep(uint16_t wait_state);
+  void finish_sleep(const char* what);
+  static constexpr unsigned long CMFA_SLEEP_QUIET_MS = 2000;  // no BMS frames for this long = asleep
+  // Number of 10ms 0x1EA sleep requests to send before we stop all CAN sending
+  // for the rest of the sleep wait.
+  static constexpr uint8_t CMFA_SLEEP_FRAMES_BEFORE_SILENCE = 10;
+  uint8_t sleep_frames_sent = 0;
+  volatile unsigned long last_bms_frame_ms = 0;
+  unsigned long sleep_request_ms = 0;
+  unsigned long bms_quiet_after_ms = 0;  // how long after the sleep request the BMS went quiet
+  bool sleep_monitoring = false;
+  volatile bool bms_quiet = false;
+  volatile uint8_t bms_wakes = 0;  // times the BMS started transmitting again after going quiet
+  char sequence_status[128] = "None";
 
   // If not null, this battery decides when the contactor can be closed and writes the value here.
   bool* allows_contactor_closing;
