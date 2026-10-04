@@ -98,7 +98,6 @@ class CmfaEvBattery : public UdsCanBattery {
   static constexpr uint16_t CMFA_UDS_TIMEOUT_SESSION_CONTROL = 10;
   static constexpr uint16_t CMFA_UDS_TIMEOUT_WRITE = 50;
   static constexpr uint16_t CMFA_NVROL_TIMEOUT_TICKS = 10;  // 1 s, per NVROL sequence step
-  static constexpr uint16_t CMFA_SLEEP_TICKS = 300;         // 30 s
 
   // Sequence error handling: a negative response or a timeout aborts the
   // sequence, wakes the pack back up and records why in sequence_status.
@@ -115,18 +114,33 @@ class CmfaEvBattery : public UdsCanBattery {
   // Sleep detection: while the pack has been asked to sleep, watch for the
   // BMS's own broadcast frames stopping. If they don't stop, the pack never
   // went through a controlled shutdown (and an NVROL reset won't be saved).
+  //
+  // Before shutting down, the inverter is given 0 W limits and we wait for
+  // the current to actually stop (the car also brings the current to zero
+  // before shutting down), so the pack never opens its contactors under load.
   void begin_sleep();
   void end_sleep();
   void start_sleep(uint16_t wait_state);  // 30 s sleep as a UDS sequence step
+  void continue_sleep(uint16_t wait_state, const char* what);
   void finish_sleep(const char* what);
   enum SleepPhase : uint8_t {
     SLEEP_AWAKE = 0,
+    SLEEP_STOPPING,  // 0 W limits, waiting for the current to stop (still sending normally)
     SLEEP_SHUTDOWN,  // sending the car's shutdown frames
     SLEEP_SILENT,    // sending nothing
   };
   uint8_t sleep_phase = SLEEP_AWAKE;
+  static constexpr int32_t CMFA_SLEEP_MAX_CURRENT_DA = 10;            // 1.0 A counts as stopped
+  static constexpr unsigned long CMFA_SLEEP_STOPPED_MS = 3000;        // ...for this long
+  static constexpr unsigned long CMFA_SLEEP_STOP_TIMEOUT_MS = 60000;  // give up (and stay awake) after this
   static constexpr unsigned long CMFA_SHUTDOWN_MS = 900;
-  static constexpr uint16_t CMFA_SHUTDOWN_TICKS = 10;         // UDS ticks to allow for the shutdown frames
+  static constexpr unsigned long CMFA_SLEEP_SILENT_MS = 30000;  // silence for the sleep sequences
+  static constexpr uint16_t CMFA_SLEEP_POLL_TICKS = 10;         // sleep sequences check progress every 1 s
+  unsigned long stopping_since_ms = 0;
+  unsigned long current_low_since_ms = 0;  // 0 = current not (yet) low
+  unsigned long silent_since_ms = 0;
+  bool sleep_cancelled = false;  // the current didn't stop, so the sleep was called off
+  int32_t pack_current_dA() const { return ((int32_t)current_raw * 10) / 4 - 5000; }
   static constexpr unsigned long CMFA_SLEEP_QUIET_MS = 2000;  // no BMS frames for this long = asleep
   volatile bool manual_sleep_requested = false;               // Sleep button pressed (and Wake not yet)
   bool manual_sleep = false;                                  // the current sleep was started by the Sleep button
@@ -395,6 +409,8 @@ class CmfaEvBattery : public UdsCanBattery {
   uint8_t bms_state = 0;
 
   static constexpr uint8_t MISSION_ENTRIES = 32;
+  static constexpr unsigned INFO_HTML_RESERVE = 2048;
+  static constexpr unsigned INFO_HTML_RESERVE_WITH_MISSIONS = 4096;
   struct {
     uint8_t mode[MISSION_ENTRIES];
     uint8_t temp_beg[MISSION_ENTRIES];

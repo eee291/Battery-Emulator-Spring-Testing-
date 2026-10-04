@@ -98,7 +98,10 @@ static int32_t bal_s(int32_t v) {
 
 String CmfaEvBattery::get_uds_info_html() {
   String content;
-  content.reserve(900);
+  // Sized for everything below (including a full mission log once it has been
+  // read), so the String doesn't grow, and briefly need two copies, while it
+  // is built. CmfaEvBatteryTest checks a full page fits.
+  content.reserve(missions.read ? INFO_HTML_RESERVE_WITH_MISSIONS : INFO_HTML_RESERVE);
 
   // clang-format off
   content << "<h4>SOC U: " << soc_u << "percent</h4>"
@@ -174,6 +177,9 @@ String CmfaEvBattery::get_uds_info_html() {
   content << "<h4>Sleep: ";
   if (sleep_phase == SLEEP_AWAKE) {
     content << "AWAKE";
+  } else if (sleep_phase == SLEEP_STOPPING) {
+    content << "STOPPING (0 W limits, waiting for the current to stop: " << pack_current_dA() << "dA, "
+            << (millis() - stopping_since_ms) / 1000 << "s)";
   } else {
     content << (manual_sleep ? "ASLEEP (Sleep button)" : "ASLEEP (sleep sequence)") << " for "
             << (millis() - sleep_request_ms) / 60000 << "m, ";
@@ -256,7 +262,7 @@ void CmfaEvBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
 
   if (from_bms) {
     last_bms_frame_ms = millis();
-    if (sleep_phase != SLEEP_AWAKE && bms_quiet) {
+    if (sleep_phase >= SLEEP_SHUTDOWN && bms_quiet) {
       // The BMS has started talking again while it should be asleep.
       bms_quiet = false;
       bms_wakes = bms_wakes + 1;
@@ -550,60 +556,33 @@ void CmfaEvBattery::handle_mission_pid(uint16_t pid, const uint8_t* data, uint16
   }
 }
 
-static const char* mission_mode_name(uint8_t mode) {
-  switch (mode) {
-    case 1:
-      return "Init";
-    case 2:
-      return "Wait";
-    case 3:
-      return "Isolated charge";
-    case 4:
-      return "Non isolated charge";
-    case 5:
-      return "External charge";
-    case 6:
-      return "Driving";
-    case 7:
-      return "Sleep transient";
-    case 8:
-      return "DC charge w/o RISOL";
-    case 9:
-      return "DC charge with RISOL";
-    default:
-      return "?";
-  }
-}
-
 void CmfaEvBattery::append_mission_html(String& content) {
   if (!missions.read) {
     content << "<h4>Mission log: not read yet</h4>";
     return;
   }
+  // One fixed-width text line per mission keeps this small (heap is tight).
   // Times are absolute pack time in minutes (same clock as DID 0x91C1), so
   // "ago" is relative to the current pack time life.
-  content << "<h4>Mission log (index " << missions.index << ", times in pack minutes)</h4>"
-          << "<table><tr><th>#</th><th>State</th><th>Start</th><th>End</th><th>Mins</th><th>Ago</th>"
-             "<th>Temp &deg;C</th><th>USOC %</th><th>km</th></tr>";
+  content << "<h4>Mission log (index " << missions.index
+          << ")</h4><pre>State: 1 Init, 2 Wait, 3 Isolated charge, 4 Non isolated charge, 5 External charge,\n"
+             "       6 Driving, 7 Sleep transient, 8/9 DC charge\n"
+             " # S    Start  Mins       Ago  Temp C  USOC %     km\n";
+  char line[64];
   for (uint8_t i = 0; i < MISSION_ENTRIES; i++) {
     if (missions.time_beg[i] == 0 && missions.time_end[i] == 0 && missions.mode[i] == 0) {
       continue;  // Unused entry
     }
     const uint32_t end = missions.time_end[i];
-    content << "<tr><td>" << i << "</td><td>" << missions.mode[i] << " " << mission_mode_name(missions.mode[i])
-            << "</td><td>" << missions.time_beg[i] << "</td><td>" << end << "</td><td>"
-            << (int32_t)(end - missions.time_beg[i]) << "</td><td>";
-    if (pack_time_life >= end) {
-      const uint32_t ago = pack_time_life - end;
-      content << (ago / 1440) << "d " << ((ago / 60) % 24) << "h " << (ago % 60) << "m";
-    } else {
-      content << "-";
-    }
-    content << "</td><td>" << ((int)missions.temp_beg[i] - 40) << " &rarr; " << ((int)missions.temp_end[i] - 40)
-            << "</td><td>" << missions.usoc_beg[i] << " &rarr; " << missions.usoc_end[i] << "</td><td>"
-            << (int32_t)((missions.dist_end[i] - 0x80000000u) / 32) << "</td></tr>";
+    const uint32_t ago = pack_time_life >= end ? pack_time_life - end : 0;
+    snprintf(line, sizeof(line), "%2u %u %8lu %5ld %3lud%02luh%02lum %3d>%-3d %3u>%-3u %6ld\n", i, missions.mode[i],
+             (unsigned long)missions.time_beg[i], (long)(int32_t)(end - missions.time_beg[i]),
+             (unsigned long)(ago / 1440), (unsigned long)((ago / 60) % 24), (unsigned long)(ago % 60),
+             (int)missions.temp_beg[i] - 40, (int)missions.temp_end[i] - 40, missions.usoc_beg[i], missions.usoc_end[i],
+             (long)(int32_t)((missions.dist_end[i] - 0x80000000u) / 32));
+    content << line;
   }
-  content << "</table>";
+  content << "</pre>";
 }
 
 void CmfaEvBattery::update_car_state_frames() {
@@ -687,13 +666,13 @@ void CmfaEvBattery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint
                             CMFA_NVROL_TIMEOUT_TICKS, 1);
       break;
     case CMFA_STATE_NVROL_SLEEP_WRITE:
-      // The temporisation write is done: stop streaming the awake byte on 0x1EA
-      // so the pack saves its state and falls asleep, then hold the bus for 30 s.
+      // The temporisation write is done: shut down like a car so the pack saves
+      // its state and falls asleep, then hold the bus for 30 s.
       start_sleep(CMFA_STATE_NVROL_SLEEP_WAIT);
       break;
     case CMFA_STATE_NVROL_SLEEP_WAIT:
-      // Wake the pack back up. The sequence ends here (no further steps sent).
-      finish_sleep("NVROL reset");
+      // Wakes the pack back up once it has been silent for 30 s.
+      continue_sleep(state, "NVROL reset");
       break;
 
       // Plain sleep sequence
@@ -704,8 +683,8 @@ void CmfaEvBattery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint
       start_sleep(CMFA_STATE_SLEEP_WAIT);
       break;
     case CMFA_STATE_SLEEP_WAIT:
-      // Wake the pack back up. The sequence ends here (no further steps sent).
-      finish_sleep("Sleep cycle");
+      // Wakes the pack back up once it has been silent for 30 s.
+      continue_sleep(state, "Sleep cycle");
       break;
 
     default:
@@ -765,12 +744,14 @@ const char* CmfaEvBattery::sequence_step_name(uint16_t state) {
 }
 
 void CmfaEvBattery::begin_sleep() {
-  sleep_phase = SLEEP_SHUTDOWN;
-  sleep_request_ms = millis();
+  sleep_phase = SLEEP_STOPPING;
+  stopping_since_ms = millis();
+  current_low_since_ms = 0;
+  sleep_cancelled = false;
   bms_quiet = false;
   bms_wakes = 0;
   bms_quiet_after_ms = 0;
-  logging.println("[CMFA] Shutting down like a car (0x3D3 = 0x44), watching for BMS frames to stop");
+  logging.println("[CMFA] Sleep requested: 0 W limits, waiting for the current to stop");
 }
 
 void CmfaEvBattery::end_sleep() {
@@ -779,13 +760,29 @@ void CmfaEvBattery::end_sleep() {
 }
 
 void CmfaEvBattery::start_sleep(uint16_t wait_state) {
-  // Allow for the ~0.9 s of shutdown frames, so the bus is silent for the full 30 s.
-  if (!sequence_wait(wait_state, CMFA_SLEEP_TICKS + CMFA_SHUTDOWN_TICKS)) {
+  // Hold UDS (in 1 s steps, see continue_sleep()) for the whole sleep.
+  if (!sequence_wait(wait_state, CMFA_SLEEP_POLL_TICKS)) {
     // UDS would keep polling (and wake the pack), so don't try.
     abort_sequence(wait_state, "UDS busy, could not start the sleep", 0);
     return;
   }
   begin_sleep();
+}
+
+void CmfaEvBattery::continue_sleep(uint16_t wait_state, const char* what) {
+  if (sleep_cancelled) {
+    sleep_cancelled = false;
+    abort_sequence(wait_state, "the current did not stop, so the pack was not put to sleep", 0);
+    return;
+  }
+  if (sleep_phase == SLEEP_SILENT && millis() - silent_since_ms >= CMFA_SLEEP_SILENT_MS) {
+    finish_sleep(what);
+    return;
+  }
+  // Not done yet: keep holding UDS.
+  if (!sequence_wait(wait_state, CMFA_SLEEP_POLL_TICKS)) {
+    abort_sequence(wait_state, "UDS busy during the sleep", 0);
+  }
 }
 
 void CmfaEvBattery::finish_sleep(const char* what) {
@@ -814,11 +811,41 @@ void CmfaEvBattery::transmit_can(unsigned long currentMillis) {
     end_sleep();
     logging.println("[CMFA] Waking pack");
   }
+  if (sleep_phase == SLEEP_STOPPING) {
+    // Wait for the inverter to stop drawing/pushing current before shutting down.
+    if (std::abs(pack_current_dA()) <= CMFA_SLEEP_MAX_CURRENT_DA) {
+      if (current_low_since_ms == 0) {
+        current_low_since_ms = currentMillis ? currentMillis : 1;
+      }
+      if (currentMillis - current_low_since_ms >= CMFA_SLEEP_STOPPED_MS) {
+        sleep_phase = SLEEP_SHUTDOWN;
+        sleep_request_ms = currentMillis;
+        logging.println("[CMFA] Current stopped, shutting down like a car (0x3D3 = 0x44)");
+      }
+    } else {
+      current_low_since_ms = 0;
+      if (currentMillis - stopping_since_ms >= CMFA_SLEEP_STOP_TIMEOUT_MS) {
+        logging.printf("[CMFA] Current still %ld dA after %lu s, not putting the pack to sleep\n",
+                       (long)pack_current_dA(), CMFA_SLEEP_STOP_TIMEOUT_MS / 1000);
+        snprintf(sequence_status, sizeof(sequence_status), "Sleep CANCELLED: current still %ld dA after %lu s",
+                 (long)pack_current_dA(), CMFA_SLEEP_STOP_TIMEOUT_MS / 1000);
+        sleep_phase = SLEEP_AWAKE;
+        if (manual_sleep) {
+          manual_sleep = false;
+          manual_sleep_requested = false;
+        } else {
+          sleep_cancelled = true;  // the sleep sequence aborts on its next step
+        }
+      }
+    }
+  }
   if (sleep_phase == SLEEP_SHUTDOWN && currentMillis - sleep_request_ms >= CMFA_SHUTDOWN_MS) {
     sleep_phase = SLEEP_SILENT;
+    silent_since_ms = currentMillis;
     logging.println("[CMFA] Shutdown frames sent, stopping all CAN sending");
   }
-  const bool awake = (sleep_phase == SLEEP_AWAKE);
+  // Still sending normally while waiting for the current to stop.
+  const bool awake = (sleep_phase <= SLEEP_STOPPING);
   const bool shutting_down = (sleep_phase == SLEEP_SHUTDOWN);
 
   // Send 10ms CAN Message
@@ -910,7 +937,7 @@ void CmfaEvBattery::transmit_can(unsigned long currentMillis) {
     // The pack is asleep on purpose, so don't report it missing.
     datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
   }
-  if (manual_sleep) {
+  if (manual_sleep && !awake) {
     // Nothing at all may be sent, or the pack wakes up. (The 30 s sleep
     // sequence holds UDS itself, and needs the UDS ticks to count down.)
     return;

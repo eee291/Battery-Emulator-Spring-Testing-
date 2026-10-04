@@ -239,13 +239,10 @@ TEST_F(CmfaEvBatteryTest, MissionLogIsDecodedIntoHtml) {
   feed_time(PID_PACK_TIME_LIFE, 1816132);
 
   std::string html = battery->get_uds_info_html().str();
-  EXPECT_NE(html.find("3 Isolated charge"), std::string::npos);
-  EXPECT_NE(html.find("6 Driving"), std::string::npos);
-  EXPECT_NE(html.find("1816051"), std::string::npos);
-  EXPECT_NE(html.find("410402"), std::string::npos);
-  EXPECT_NE(html.find("410408"), std::string::npos);
-  EXPECT_NE(html.find("0d 1h 21m"), std::string::npos);  // 1816132 - 1816051 = 81 min ago
-  EXPECT_NE(html.find("17 &rarr;"), std::string::npos);  // 57 - 40
+  EXPECT_NE(html.find(" 0 3  1816051     0"), std::string::npos);
+  EXPECT_NE(html.find(" 1 6   410402     6"), std::string::npos);  // 410402 -> 410408
+  EXPECT_NE(html.find("0d01h21m"), std::string::npos);             // 1816132 - 1816051 = 81 min ago
+  EXPECT_NE(html.find(" 17>"), std::string::npos);                 // 57 - 40
 }
 
 TEST_F(CmfaEvBatteryTest, DoesNotChasePackTimeLife) {
@@ -369,8 +366,64 @@ class CmfaEvBatterySleepTest : public CmfaEvBatteryTest {
       }
     }
   }
+  unsigned long first_shutdown_frame() {
+    for (const auto& e : log) {
+      if (e.second.ID == 0x3D3 && e.second.data.u8[0] == 0x44) {
+        return e.first;
+      }
+    }
+    return 0;
+  }
+  // 0x127 from the pack with the given current (positive = charging).
+  void feed_current_dA(int32_t current_dA) {
+    const uint16_t raw = (uint16_t)(((current_dA + 5000) * 4) / 10);
+    CAN_frame f = {.FD = false,
+                   .ext_ID = false,
+                   .DLC = 8,
+                   .ID = 0x127,
+                   .data = {0x19, (uint8_t)(raw >> 8), (uint8_t)raw, 0x54, 0x9C, 0x40, 0x02, 0x61}};
+    battery->handle_incoming_can_frame(f);
+  }
   std::vector<std::pair<unsigned long, CAN_frame>> log;
 };
+
+TEST_F(CmfaEvBatterySleepTest, SleepWaitsForTheCurrentToStop) {
+  feed_current_dA(-150);  // inverter drawing 15 A
+  run_10ms(500);
+  battery->request_sleep();
+  run_10ms(10000);
+  // Still awake and sending normally, but with 0 W limits.
+  EXPECT_EQ(first_shutdown_frame(), 0u);
+  battery->update_values();
+  EXPECT_EQ(datalayer.battery.status.max_discharge_power_W, 0u);
+  EXPECT_NE(battery->get_uds_info_html().str().find("STOPPING"), std::string::npos);
+
+  // The inverter stops: shut down 3 s later.
+  const unsigned long t_stopped = now;
+  feed_current_dA(0);
+  run_10ms(5000);
+  const unsigned long t_shutdown = first_shutdown_frame();
+  EXPECT_GE(t_shutdown, t_stopped + 3000);
+  EXPECT_LE(t_shutdown, t_stopped + 3200);
+}
+
+TEST_F(CmfaEvBatterySleepTest, SleepIsCancelledIfTheCurrentNeverStops) {
+  feed_current_dA(120);  // still charging at 12 A
+  // Broadcast limits: 10 kW charge, 50 kW discharge.
+  CAN_frame f3d6 = {
+      .FD = false, .ext_ID = false, .DLC = 8, .ID = 0x3D6, .data = {0x11, 0x40, 20, 100, 0x3D, 0x5C, 0x55, 0x3D}};
+  battery->handle_incoming_can_frame(f3d6);
+  run_10ms(500);
+  battery->request_sleep();
+  run_10ms(61000);
+  EXPECT_EQ(first_shutdown_frame(), 0u);
+  EXPECT_FALSE(battery->is_sleep_requested());  // back to awake, Sleep button shown again
+  std::string html = battery->get_uds_info_html().str();
+  EXPECT_NE(html.find("Sleep: AWAKE"), std::string::npos);
+  EXPECT_NE(html.find("Sleep CANCELLED"), std::string::npos);
+  battery->update_values();
+  EXPECT_EQ(datalayer.battery.status.max_charge_power_W, 10000u);  // limits restored
+}
 
 TEST_F(CmfaEvBatterySleepTest, OxEAIsAlwaysZero) {
   battery->reset_BMS();  // 30 s sleep cycle
@@ -391,10 +444,14 @@ TEST_F(CmfaEvBatterySleepTest, OxEAIsAlwaysZero) {
 
 TEST_F(CmfaEvBatterySleepTest, SleepButtonShutsDownLikeACarThenGoesSilent) {
   run_10ms(1000);
-  const unsigned long t_sleep = now;
+  const unsigned long t_request = now;
   battery->request_sleep();
   EXPECT_TRUE(battery->is_sleep_requested());
-  run_10ms(5000);
+  run_10ms(8000);
+  // No current flowing: the shutdown starts 3 s after the request.
+  const unsigned long t_sleep = first_shutdown_frame() - 10;
+  EXPECT_GE(t_sleep, t_request + 3000);
+  EXPECT_LE(t_sleep, t_request + 3200);
 
   // Shutdown phase (~0.9 s): only 0x3D3 (0x44), 0x3D5 (0xE0), 0x135, 0x3D4.
   bool seen_3d3 = false, seen_3d5 = false;
@@ -438,14 +495,7 @@ TEST_F(CmfaEvBatterySleepTest, SleepCycleIsSilentFor30Seconds) {
   run_10ms(500);
   battery->reset_BMS();
   run_10ms(10000);  // the sequence starts once the PID request in flight (unanswered here) times out
-  // Find the first shutdown frame.
-  unsigned long t_shutdown = 0;
-  for (const auto& e : log) {
-    if (e.second.ID == 0x3D3 && e.second.data.u8[0] == 0x44) {
-      t_shutdown = e.first;
-      break;
-    }
-  }
+  const unsigned long t_shutdown = first_shutdown_frame();
   ASSERT_NE(t_shutdown, 0u);
   run_10ms(30000);
   // Silent from the end of the shutdown frames for the full 30 s.
@@ -458,4 +508,44 @@ TEST_F(CmfaEvBatterySleepTest, SleepCycleIsSilentFor30Seconds) {
   EXPECT_TRUE(seen_125);
 }
 
+}  // namespace
+namespace {
+// Heap is tight: the info page is built in a String reserved up front, so it
+// must never outgrow that reservation (or it reallocates, briefly needing two
+// copies). Fill every field to its widest and check it still fits.
+TEST_F(CmfaEvBatteryTest, InfoHtmlFitsItsReservation) {
+  feed_time(PID_PACK_TIME_LIFE, 16777000);
+  feed_time(PID_ABSOLUTE_TIME_SAVED, 16777000);
+  run_for(200);
+  EXPECT_LE(battery->get_uds_info_html().str().size(), 2048u);  // no mission log yet
+
+  uint8_t modes[32], temps[32], usoc[32], times[96], dist[128];
+  for (int i = 0; i < 32; i++) {
+    modes[i] = 6;
+    temps[i] = 0;  // -40 C
+    usoc[i] = 100;
+  }
+  for (int i = 0; i < 96; i += 3) {
+    times[i] = 0x00;  // started long ago, so "ago" is as wide as it gets
+    times[i + 1] = 0x00;
+    times[i + 2] = 0x01;
+  }
+  for (int i = 0; i < 128; i += 4) {
+    dist[i] = 0x00;  // most negative distance
+    dist[i + 1] = dist[i + 2] = dist[i + 3] = 0x00;
+  }
+  battery->handle_pid(0x9270, 0, modes, 32);
+  battery->handle_pid(0x9271, 0, temps, 32);
+  battery->handle_pid(0x9272, 0, temps, 32);
+  battery->handle_pid(0x9273, 0, usoc, 32);
+  battery->handle_pid(0x9274, 0, usoc, 32);
+  battery->handle_pid(0x9275, 0, times, 96);
+  battery->handle_pid(0x9276, 0, times, 96);
+  battery->handle_pid(0x9278, 0, dist, 128);
+  battery->handle_pid(0x9279, 0, modes, 1);
+  battery->initiate_balancing();
+  battery->request_sleep();
+  run_for(100);
+  EXPECT_LE(battery->get_uds_info_html().str().size(), 4096u);
+}
 }  // namespace
