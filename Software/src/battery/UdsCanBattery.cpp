@@ -62,6 +62,13 @@ void UdsCanBattery::transmit_uds_can(unsigned long currentMillis) {
       // Don't start the sequence until the pause expires.
       return;
     }
+    // A PID request that timed out may be waiting to be retried (nothing is
+    // in flight, but pending_pid is still set). That would make the
+    // sequence's first send_sequence_message()/sequence_wait() be refused, so
+    // drop the retry: next_pid is kept, so the PID is requested again once the
+    // sequence has finished.
+    pending_pid = 0;
+    pid_retries = 0;
     // A new sequence was requested, start it now.
     uint16_t state = pending_seq_state;
     pending_seq_state = UDS_STATE_IDLE;

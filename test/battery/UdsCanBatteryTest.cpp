@@ -382,6 +382,32 @@ TEST_F(UdsCanBatteryTest, StartSequenceDispatchesTheStartState) {
   EXPECT_TRUE(battery->seq_calls[0].data.empty());
 }
 
+// A sequence queued while a PID request is in flight starts once that request
+// times out. The timed-out PID would otherwise still be pending (waiting for
+// its retry), and the sequence's first step would be refused.
+TEST_F(UdsCanBatteryTest, SequenceQueuedDuringPidRequestCanSendItsFirstStep) {
+  const uint16_t pids[] = {0x9001, 0x9002};
+  battery->set_pid_scan_list(pids, 2);
+  tick(1000);  // 0x9001 requested, never answered
+  ASSERT_EQ(requested_pid(last_frame(get_transmitted_frames())), 0x9001);
+
+  EXPECT_TRUE(battery->start_sequence(0x1001));
+  tick(1100);
+  tick(1200);  // 0x9001 times out, the sequence starts
+  ASSERT_EQ(battery->seq_calls.size(), 1u);
+  EXPECT_EQ(battery->seq_calls[0].state, 0x1001);
+
+  uint8_t payload[] = {0x03};
+  EXPECT_TRUE(battery->send_sequence_message(0x1002, SID::DiagnosticSessionControl, payload, 1, 2, 0));
+  EXPECT_EQ(last_frame(get_transmitted_frames()).data.u8[1], 0x10);
+
+  // After the sequence, the dropped PID is requested again.
+  tick(1300);
+  tick(1400);  // step times out (no retries), sequence ends
+  tick(1500);
+  EXPECT_EQ(requested_pid(last_frame(get_transmitted_frames())), 0x9001);
+}
+
 // A queued (not yet started) sequence counts as busy: start_sequence() also
 // refuses new sequences while one is queued, so the gate and the reporter must
 // agree.

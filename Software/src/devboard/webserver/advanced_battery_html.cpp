@@ -67,6 +67,18 @@ std::vector<BatteryCommand> battery_commands = {
     {"toggleSOC", "Toggle SOC method",
      "toggle SOC method? This will toggle between ESTIMATED and MEASURED SOC methods.",
      [](Battery* b) { return b && b->supports_toggle_SOC_method(); }, [](Battery* b) { b->toggle_SOC_method(); }},
+    {"batterySleep", "Sleep battery",
+     "put the battery to sleep? All CAN traffic to it stops (power stays on) until you press Wake, and the "
+     "inverter is given 0 W limits meanwhile.",
+     [](Battery* b) { return b && b->supports_sleep_wake() && !b->is_sleep_requested(); },
+     [](Battery* b) { b->request_sleep(); }},
+    {"batteryWake", "Wake battery", "wake the battery up again?",
+     [](Battery* b) { return b && b->supports_sleep_wake() && b->is_sleep_requested(); },
+     [](Battery* b) { b->request_wake(); }},
+    {"togglePowerLimitSource", "Toggle power limit source",
+     "toggle which of the power limits reported by the battery are used? This takes effect immediately.",
+     [](Battery* b) { return b && b->supports_toggle_power_limit_source(); },
+     [](Battery* b) { b->toggle_power_limit_source(); }},
     {"resetEnergySavingMode", "Reset Energy Saving Mode", "reset energy saving mode to normal?",
      [](Battery* b) { return b && b->supports_energy_saving_mode_reset(); },
      [](Battery* b) { b->reset_energy_saving_mode(); }},
@@ -249,7 +261,12 @@ class AdvancedBatteryResponse : public AsyncAbstractResponse {
     html += "<button onclick='ask" + String(cmd.identifier) + "(" + String(selected) + ")'>" + cmd.title +
             "</button><script>function ask" + cmd.identifier + "(batteryNum){";
     if (cmd.prompt) {
-      html += "if(window.confirm('Are you sure you want to " + String(cmd.prompt) + "'))";
+      // The prompt goes inside a single-quoted JS string: escape it, or an
+      // apostrophe in the text breaks the whole script.
+      String prompt(cmd.prompt);
+      prompt.replace("\\", "\\\\");
+      prompt.replace("'", "\\'");
+      html += "if(window.confirm('Are you sure you want to " + prompt + "'))";
     }
     html += "{" + String(cmd.identifier) + "(batteryNum);}}function " + cmd.identifier +
             "(batteryNum){var xhr=new XMLHttpRequest();xhr.open('PUT','/" + cmd.identifier + "',true);";

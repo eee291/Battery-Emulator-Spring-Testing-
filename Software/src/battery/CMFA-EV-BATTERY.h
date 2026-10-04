@@ -38,6 +38,28 @@ class CmfaEvBattery : public UdsCanBattery {
   bool supports_reset_BMS() { return true; }
   void reset_BMS() { start_sequence(CMFA_STATE_SLEEP_START); }
 
+  // Sleep/Wake buttons: put the pack to sleep like a car does (see
+  // begin_sleep()) and keep the bus silent until woken. Not persisted.
+  bool supports_sleep_wake() override { return true; }
+  bool is_sleep_requested() override { return manual_sleep_requested; }
+  void request_sleep() override { manual_sleep_requested = true; }
+  void request_wake() override { manual_sleep_requested = false; }
+
+  // Experimental: the balancing buttons switch the car state we emulate
+  // between the emulator's original frames and the frames a real car sends
+  // while AC charging, in the hope that the pack then behaves as it does at
+  // the end of a real charge (and balances). Not persisted across reboots.
+  bool supports_balancing_request() override { return true; }
+  void initiate_balancing() override { car_mode = CAR_MODE_CHARGING; }
+  void end_balancing() override { car_mode = CAR_MODE_DEFAULT; }
+
+  // The pack reports charge/discharge power limits both in the 0x3D6
+  // broadcast and via UDS DIDs. The broadcast limits are used by default; some
+  // packs broadcast zero limits (e.g. in an error state) while the DIDs are
+  // sensible, so this switches between them at runtime (not persisted).
+  bool supports_toggle_power_limit_source() override { return true; }
+  void toggle_power_limit_source() override { use_broadcast_power_limits = !use_broadcast_power_limits; }
+
   String get_uds_info_html() override;
   const char* get_dtc_json_filename() override { return "cmfa_dacia_spring_renault_kze_dtc.json"; }
 
@@ -57,8 +79,8 @@ class CmfaEvBattery : public UdsCanBattery {
 
     // NVROL reset sequence (ported from the Renault Zoe Gen2 integration).
     // After resetting the NVROL memory we enable "temporisation before sleep",
-    // then send a few 0x1EA sleep requests and stop all CAN sending for 30 s so
-    // the pack saves its state and falls asleep, and finally wake it back up.
+    // then shut down like a car and stop all CAN sending for 30 s so the pack
+    // saves its state and falls asleep, and finally wake it back up.
     CMFA_STATE_NVROL_START = 0x10,
     CMFA_STATE_NVROL_SESSION,        // 0x10 0x03 (extended diagnostic session)
     CMFA_STATE_NVROL_ROUTINE,        // 0x31 01 B0 09 (NVROL reset routine)
@@ -78,31 +100,39 @@ class CmfaEvBattery : public UdsCanBattery {
   static constexpr uint16_t CMFA_NVROL_TIMEOUT_TICKS = 10;  // 1 s, per NVROL sequence step
   static constexpr uint16_t CMFA_SLEEP_TICKS = 300;         // 30 s
 
-  // 0x1EA is the keep-alive/wakeup frame towards the BMS; 0x01 asks it to go
-  // to sleep, 0x00 keeps it awake.
-  static constexpr uint8_t CMFA_1EA_AWAKE = 0x00;
-  static constexpr uint8_t CMFA_1EA_SLEEP = 0x01;
-
   // Sequence error handling: a negative response or a timeout aborts the
   // sequence, wakes the pack back up and records why in sequence_status.
   bool sequence_step_rejected(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len);
   void abort_sequence(uint16_t state, const char* reason, uint8_t nrc);
   static const char* sequence_step_name(uint16_t state);
 
+  // Sleeping. A real car shuts down by switching 0x3D3 byte 0 to 0x44 (and
+  // 0x3D5 byte 3 to 0xE0): its 10 ms frames stop at once, 0x3D3/0x3D4/0x3D5/
+  // 0x135 carry on for ~0.9 s, and then the bus is silent. (0x1EA stays 0x00
+  // throughout; the car never sends anything else in it.) Any frame on the bus
+  // wakes the pack again, so nothing at all may be sent while it sleeps.
+  //
   // Sleep detection: while the pack has been asked to sleep, watch for the
   // BMS's own broadcast frames stopping. If they don't stop, the pack never
   // went through a controlled shutdown (and an NVROL reset won't be saved).
-  void start_sleep(uint16_t wait_state);
+  void begin_sleep();
+  void end_sleep();
+  void start_sleep(uint16_t wait_state);  // 30 s sleep as a UDS sequence step
   void finish_sleep(const char* what);
+  enum SleepPhase : uint8_t {
+    SLEEP_AWAKE = 0,
+    SLEEP_SHUTDOWN,  // sending the car's shutdown frames
+    SLEEP_SILENT,    // sending nothing
+  };
+  uint8_t sleep_phase = SLEEP_AWAKE;
+  static constexpr unsigned long CMFA_SHUTDOWN_MS = 900;
+  static constexpr uint16_t CMFA_SHUTDOWN_TICKS = 10;         // UDS ticks to allow for the shutdown frames
   static constexpr unsigned long CMFA_SLEEP_QUIET_MS = 2000;  // no BMS frames for this long = asleep
-  // Number of 10ms 0x1EA sleep requests to send before we stop all CAN sending
-  // for the rest of the sleep wait.
-  static constexpr uint8_t CMFA_SLEEP_FRAMES_BEFORE_SILENCE = 10;
-  uint8_t sleep_frames_sent = 0;
+  volatile bool manual_sleep_requested = false;               // Sleep button pressed (and Wake not yet)
+  bool manual_sleep = false;                                  // the current sleep was started by the Sleep button
   volatile unsigned long last_bms_frame_ms = 0;
   unsigned long sleep_request_ms = 0;
   unsigned long bms_quiet_after_ms = 0;  // how long after the sleep request the BMS went quiet
-  bool sleep_monitoring = false;
   volatile bool bms_quiet = false;
   volatile uint8_t bms_wakes = 0;  // times the BMS started transmitting again after going quiet
   char sequence_status[128] = "None";
@@ -110,12 +140,40 @@ class CmfaEvBattery : public UdsCanBattery {
   // If not null, this battery decides when the contactor can be closed and writes the value here.
   bool* allows_contactor_closing;
 
-  uint16_t rescale_raw_SOC(uint32_t raw_SOC);
+  uint16_t rescale_raw_SOC(uint32_t raw_SOC, uint32_t max_soc);
 
-  static const int MAX_PACK_VOLTAGE_DV = 3040;  // 5000 = 500.0V
+  // Vehicle clock (0x3D4). The car broadcasts a free-running minute counter
+  // in bytes 3-5, and the pack keeps its own copies (DIDs 0x91C1 pack time
+  // life, 0x9261 absolute time of vehicle saved). The BMS gets confused if
+  // this time ever goes backwards, so we don't send 0x3D4 until both DIDs have
+  // been read, start just above the larger of the two, and only ever move
+  // forwards from there.
+  //
+  // Only 0x9261 is followed after that: in the car log 0x91C1 ran a fixed
+  // offset ahead of 0x3D4, so if the pack advances it from our 0x3D4, chasing
+  // it would make the time run away.
+  void update_vehicle_time_from_pack();
+  void log_pack_time_change(const char* name, uint32_t old_value, uint32_t new_value);
+  // Diagnostics, to spot the time running ahead of real time.
+  uint32_t vehicle_time_start = 0;          // first value sent
+  unsigned long vehicle_time_start_ms = 0;  // when it was first sent
+  uint32_t vehicle_time_jumped_min = 0;     // total forward jumps after the start
+  uint16_t vehicle_time_jumps = 0;
+  int32_t initial_offset_pack_time_life = 0;  // 0x91C1 - vehicle time at the start
+  int32_t initial_offset_time_saved = 0;      // 0x9261 - vehicle time at the start
+  static constexpr unsigned long VEHICLE_TIME_TICK_MS = 60000;
+  static constexpr uint32_t VEHICLE_TIME_MAX = 0xFFFFFF;  // 24-bit counter
+  bool vehicle_time_valid = false;
+  uint32_t vehicle_time_min = 0;
+  unsigned long vehicle_time_last_tick_ms = 0;
+
+  // A real car charges to 304.5 V at rest (4.23 V/cell average), 306.0 V
+  // briefly with ~12 A still flowing. Allow a little above that, so a
+  // fully charged pack isn't flagged as overvoltage.
+  static const int MAX_PACK_VOLTAGE_DV = 3080;  // 5000 = 500.0V
   static const int MIN_PACK_VOLTAGE_DV = 2185;
   static const int MAX_CELL_DEVIATION_MV = 100;
-  static const int MAX_CELL_VOLTAGE_MV = 4250;  // Emergency stop if above
+  static const int MAX_CELL_VOLTAGE_MV = 4280;  // Emergency stop if above (308.0 V / 72)
   static const int MIN_CELL_VOLTAGE_MV = 2700;  // Emergency stop if below
 
   // OBD2 PID polls
@@ -241,6 +299,17 @@ class CmfaEvBattery : public UdsCanBattery {
   static const int PID_POLL_BMS_STATE = 0x9259;
   static const int PID_POLL_BALANCE_SWITCHES = 0x912B;
 
+  // Mission log: 32-entry tables, one entry per "mission" (charge/drive/...).
+  static const int PID_POLL_MISSION_MODE = 0x9270;      // BMS state, 1 byte each
+  static const int PID_POLL_MISSION_TEMP_BEG = 0x9271;  // degC + 40, 1 byte each
+  static const int PID_POLL_MISSION_TEMP_END = 0x9272;  // degC + 40, 1 byte each
+  static const int PID_POLL_MISSION_USOC_BEG = 0x9273;  // %, 1 byte each
+  static const int PID_POLL_MISSION_USOC_END = 0x9274;  // %, 1 byte each
+  static const int PID_POLL_MISSION_TIME_BEG = 0x9275;  // pack time minutes, 3 bytes each
+  static const int PID_POLL_MISSION_TIME_END = 0x9276;  // pack time minutes, 3 bytes each
+  static const int PID_POLL_MISSION_DIST_END = 0x9278;  // 0x80000000 + km/32, 4 bytes each
+  static const int PID_POLL_MISSION_INDEX = 0x9279;
+
   CAN_frame CMFA_1EA = {.FD = false, .ext_ID = false, .DLC = 1, .ID = 0x1EA, .data = {0x00}};
   CAN_frame CMFA_125 = {.FD = false,
                         .ext_ID = false,
@@ -258,6 +327,31 @@ class CmfaEvBattery : public UdsCanBattery {
                         .DLC = 8,
                         .ID = 0x3D3,
                         .data = {0x47, 0x30, 0x00, 0x02, 0x5D, 0x80, 0x5D, 0xE7}};
+  // Bytes 0-2 and 6-7 are copied from a real car at idle (meaning unknown /
+  // 0x80 = no power demand / idle flags); bytes 3-5 are the vehicle time.
+  CAN_frame CMFA_3D4 = {.FD = false,
+                        .ext_ID = false,
+                        .DLC = 8,
+                        .ID = 0x3D4,
+                        .data = {0x01, 0x2A, 0xD9, 0x00, 0x00, 0x00, 0x80, 0x04}};
+  // Only sent while emulating charging: byte 3 0x60 = charging (0x40 plug
+  // present, 0x00 unplugged, 0xE0 shutting down in the car log).
+  CAN_frame CMFA_3D5 = {.FD = false,
+                        .ext_ID = false,
+                        .DLC = 7,
+                        .ID = 0x3D5,
+                        .data = {0xFF, 0xFF, 0x1E, 0x60, 0x00, 0x00, 0x00}};
+  // 0x3D3/0x3D5 as a real car sends them while shutting down.
+  CAN_frame CMFA_3D3_SHUTDOWN = {.FD = false,
+                                 .ext_ID = false,
+                                 .DLC = 8,
+                                 .ID = 0x3D3,
+                                 .data = {0x44, 0x1E, 0x00, 0x01, 0x5D, 0xA0, 0xB2, 0xCA}};
+  CAN_frame CMFA_3D5_SHUTDOWN = {.FD = false,
+                                 .ext_ID = false,
+                                 .DLC = 7,
+                                 .ID = 0x3D5,
+                                 .data = {0xFF, 0xFF, 0x1E, 0xE0, 0x00, 0x00, 0x00}};
   CAN_frame CMFA_59B = {.FD = false, .ext_ID = false, .DLC = 3, .ID = 0x59B, .data = {0x00, 0x02, 0x00}};
   bool end_of_charge = false;
   bool interlock_flag = false;
@@ -299,6 +393,22 @@ class CmfaEvBattery : public UdsCanBattery {
   int32_t initial_balance_capacity_wake = INT32_MIN;
   int32_t initial_balance_time_wake = INT32_MIN;
   uint8_t bms_state = 0;
+
+  static constexpr uint8_t MISSION_ENTRIES = 32;
+  struct {
+    uint8_t mode[MISSION_ENTRIES];
+    uint8_t temp_beg[MISSION_ENTRIES];
+    uint8_t temp_end[MISSION_ENTRIES];
+    uint8_t usoc_beg[MISSION_ENTRIES];
+    uint8_t usoc_end[MISSION_ENTRIES];
+    uint32_t time_beg[MISSION_ENTRIES];
+    uint32_t time_end[MISSION_ENTRIES];
+    uint32_t dist_end[MISSION_ENTRIES];
+    uint8_t index = 0xFF;
+    bool read = false;  // true once the times have been read
+  } missions = {};
+  void handle_mission_pid(uint16_t pid, const uint8_t* data, uint16_t length);
+  void append_mission_html(String& content);
   uint8_t temporisation = 0xFF;  // 0xFF until the DID has been read at least once
 
   // Automatically re-enable temporisation at most every 60s.
@@ -314,7 +424,11 @@ class CmfaEvBattery : public UdsCanBattery {
   unsigned long previousMillis10ms = 0;
 
   static const int MAXSOC = 9000;  //90.00 Raw SOC displays this value when battery is at 100%
-  static const int MINSOC = 500;   //5.00 Raw SOC displays this value when battery is at 0%
+  // While emulating charging, report 100% only when the pack itself says
+  // 100.00% (a real car charges on until then and beyond: its dash shows 100%
+  // at raw 97.5%, and the pack ends the charge itself after reaching 100%).
+  static const int MAXSOC_CHARGING = 10000;
+  static const int MINSOC = 500;  //5.00 Raw SOC displays this value when battery is at 0%
 
   uint8_t heartbeat = 0;   //Alternates between 0x55 and 0xAA every 5th frame
   uint8_t heartbeat2 = 0;  //Alternates between 0x55 and 0xAA every 5th frame
@@ -328,6 +442,25 @@ class CmfaEvBattery : public UdsCanBattery {
   int16_t lowest_cell_temperature = 0;
   uint32_t discharge_power_w = 0;
   uint32_t charge_power_w = 0;
+  // 0x127 byte 0: the pack's own charge power request (same as Zoe 0x155
+  // byte 0, 300 W/bit). Steps down to 0 as the pack ends a charge itself.
+  uint32_t charge_power_request_w = 0;
+  volatile bool use_broadcast_power_limits = true;
+  // 0x43C byte 0: bit 6 set (0x95/0x96) while the pack is idle, clear (0x55)
+  // while charging or READY. 0xFF = not seen yet.
+  uint8_t status_43c = 0xFF;
+  // 0x3D7 byte 0: the pack's mode as seen in a real car: 0x0A charging,
+  // 0x24 idle, 0x2A READY. 0xFF = not seen yet.
+  uint8_t status_3d7 = 0xFF;
+
+  // Car state we emulate on 0x3D3/0x3D5/0x3D4/0x135.
+  enum CarMode : uint8_t {
+    CAR_MODE_DEFAULT = 0,   // The emulator's original frames (pack reports idle)
+    CAR_MODE_CHARGING = 1,  // As a real car sends while AC charging
+  };
+  volatile uint8_t car_mode = CAR_MODE_DEFAULT;
+  uint8_t frames_3d3 = 0;  // for the 0x5D/0xB2 swap in bytes 4/6 every 3 frames
+  void update_car_state_frames();
 };
 
 #endif

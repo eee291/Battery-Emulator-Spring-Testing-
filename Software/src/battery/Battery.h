@@ -111,6 +111,13 @@ class Battery {
   virtual bool supports_manual_balancing() { return false; }
   virtual bool supports_real_BMS_status() { return false; }
   virtual bool supports_toggle_SOC_method() { return false; }
+  // Batteries that report power limits two ways (e.g. CAN broadcast and UDS) can let the user switch
+  // between them at runtime.
+  virtual bool supports_toggle_power_limit_source() { return false; }
+  // Batteries that can be put to sleep (all CAN traffic to them stopped, power left on) and woken again
+  // on request, e.g. so the pack can balance while asleep.
+  virtual bool supports_sleep_wake() { return false; }
+  virtual bool is_sleep_requested() { return false; }
   virtual bool supports_energy_saving_mode_reset() { return false; }
   virtual bool supports_factory_mode_method() { return false; }
   virtual bool supports_chademo_restart() { return false; }
@@ -140,6 +147,9 @@ class Battery {
   virtual void request_open_contactors() {}
   virtual void request_close_contactors() {}
   virtual void toggle_SOC_method() {}
+  virtual void toggle_power_limit_source() {}
+  virtual void request_sleep() {}
+  virtual void request_wake() {}
   virtual void reset_energy_saving_mode() {}
   virtual void set_factory_mode() {}
   virtual void chademo_restart() {}
