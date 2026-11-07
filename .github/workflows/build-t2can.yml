@@ -1,0 +1,51 @@
+name: Build LilyGo T-2CAN Firmware
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-t2can:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream tags
+        run: git fetch https://github.com/dalathegreat/Battery-Emulator.git --tags --no-recurse-submodules
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio-t2can-${{ hashFiles('platformio.ini', 'sdkconfig.be_size.defaults') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-t2can-
+
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+
+      - name: Build firmware for LilyGo T-2CAN
+        run: pio run -e lilygo_2CAN_330
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: battery-emulator-lilygo-t-2can
+          path: .pio/build/lilygo_2CAN_330/firmware.bin
