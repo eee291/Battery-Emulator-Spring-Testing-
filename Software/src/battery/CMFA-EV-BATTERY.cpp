@@ -286,7 +286,7 @@ void CmfaEvBattery::handle_pid(uint16_t poll_pid, const uint8_t* data, uint8_t l
       soc_u = (length == 1) ? ((uint32_t)data[0] * 50) : rescale_raw_SOC(value);
       break;
     case PID_POLL_SOH_AVERAGE:
-      soh_average = (length == 1) ? ((uint16_t)data[0] * 50) : value;
+      soh_average = (length == 1) ? (uint16_t)((uint16_t)data[0] * 50) : value;
       break;
     case PID_POLL_PACK_VOLTAGE:
       pack_voltage = value;
@@ -298,13 +298,13 @@ void CmfaEvBattery::handle_pid(uint16_t poll_pid, const uint8_t* data, uint8_t l
       max_cell_voltage = (value * 9765) / 10000;
       break;
     case PID_POLL_CELL_NUMBER_HIGHEST_VOLTAGE:
-      highest_cell_number = value;
+      highest_cell_number = (uint8_t)value;
       break;
     case PID_POLL_MIN_CELL_VOLTAGE:
       min_cell_voltage = (value * 9765) / 10000;
       break;
     case PID_POLL_CELL_NUMBER_LOWEST_VOLTAGE:
-      lowest_cell_number = value;
+      lowest_cell_number = (uint8_t)value;
       break;
     case PID_POLL_INSTANT_CURRENT:
       instant_current_raw = value;
@@ -313,25 +313,25 @@ void CmfaEvBattery::handle_pid(uint16_t poll_pid, const uint8_t* data, uint8_t l
       averaged_current_raw = value;
       break;
     case PID_POLL_MAXIMUM_GENERATED_POWER:
-      max_regen_power = value * 250;
+      max_regen_power = (uint32_t)value * 250;
       break;
     case PID_POLL_AVAILABLE_POWER:
-      max_discharge_power = value * 250;
+      max_discharge_power = (uint32_t)value * 250;
       break;
     case PID_POLL_LV_BAT:
       lv_bat_mv = (value * 9765) / 10000;
       break;
     case PID_POLL_AVERAGE_TEMPERATURE:
-      average_temperature = (length == 1) ? (((int16_t)data[0] - 40) * 10) : (int16_t)(((int32_t)value - 400) / 2);
+      average_temperature = (length == 1) ? (int16_t)(((int16_t)data[0] - 40) * 10) : (int16_t)(((int32_t)value - 400) / 2);
       break;
     case PID_POLL_MIN_TEMPERATURE:
-      minimum_temperature = (length == 1) ? (((int16_t)data[0] - 40) * 10) : (int16_t)(((int32_t)value - 400) / 2);
+      minimum_temperature = (length == 1) ? (int16_t)(((int16_t)data[0] - 40) * 10) : (int16_t)(((int32_t)value - 400) / 2);
       break;
     case PID_POLL_MAX_TEMPERATURE:
-      maximum_temperature = (length == 1) ? (((int16_t)data[0] - 40) * 10) : (int16_t)(((int32_t)value - 400) / 2);
+      maximum_temperature = (length == 1) ? (int16_t)(((int16_t)data[0] - 40) * 10) : (int16_t)(((int32_t)value - 400) / 2);
       break;
     case PID_POLL_MAXIMUM_CHARGE_POWER:
-      max_charge_power = value * 250;
+      max_charge_power = (uint32_t)value * 250;
       break;
     case PID_POLL_END_OF_CHARGE_FLAG:
       end_of_charge_flag = (uint8_t)value;
@@ -627,10 +627,12 @@ void CmfaEvBattery::update_car_state_frames() {
 
 void CmfaEvBattery::start_uds_sequence(CmfaUdsState first_step, const char* label) {
   if (uds_state != UDS_IDLE) {
+    logging.printf("CMFA: %s ignored, UDS busy (state=%u)\n", label, (unsigned)uds_state);
     return;
   }
   uds_state = first_step;
   uds_step_started_ms = millis();
+  logging.printf("CMFA: %s sequence -> step 1: 10 03 (Extended Diagnostic Session)\n", label);
   transmit_can_frame(&CMFA_EXT_SESSION);
   if (first_step == UDS_NVROL_EXT_SESSION_1) {
     last_nvrol_status = "In progress: sent 10 03";
@@ -642,27 +644,33 @@ void CmfaEvBattery::on_uds_sequence_step() {
   switch (uds_state) {
     case UDS_TEMP_EXT_SESSION:
       uds_state = UDS_TEMP_WRITE_9281;
+      logging.printf("CMFA: Temporisation sequence -> step 2: 2E 92 81 01\n");
       transmit_can_frame(&CMFA_WRITE_9281);
       break;
     case UDS_TEMP_WRITE_9281:
+      logging.printf("CMFA: Temporisation enabled (0x9281 = 0x01)\n");
       uds_state = UDS_IDLE;
       break;
     case UDS_NVROL_EXT_SESSION_1:
       uds_state = UDS_NVROL_ROUTINE_B009;
+      logging.printf("CMFA: NVROL sequence -> step 2: 31 01 B0 09\n");
       last_nvrol_status = "In progress: sent 31 01 B0 09";
       transmit_can_frame(&CMFA_ROUTINE_B009);
       break;
     case UDS_NVROL_ROUTINE_B009:
       uds_state = UDS_NVROL_EXT_SESSION_2;
+      logging.printf("CMFA: NVROL sequence -> step 3: 10 03 (Extended Diagnostic Session)\n");
       last_nvrol_status = "In progress: sent second 10 03";
       transmit_can_frame(&CMFA_EXT_SESSION);
       break;
     case UDS_NVROL_EXT_SESSION_2:
       uds_state = UDS_NVROL_WRITE_9281;
+      logging.printf("CMFA: NVROL sequence -> step 4: 2E 92 81 01\n");
       last_nvrol_status = "In progress: sent 2E 92 81 01";
       transmit_can_frame(&CMFA_WRITE_9281);
       break;
     case UDS_NVROL_WRITE_9281:
+      logging.printf("CMFA: NVROL UDS sequence complete -> sleeping BMS for %lus\n", NVROL_SLEEP_DURATION_MS / 1000);
       uds_state = UDS_IDLE;
       start_sleep("NVROL");
       break;
@@ -678,6 +686,7 @@ void CmfaEvBattery::on_uds_sequence_timeout() {
 
 void CmfaEvBattery::sequence_step_rejected(const char* tag) {
   if (uds_state == UDS_NVROL_WRITE_9281 || uds_state == UDS_TEMP_WRITE_9281) {
+    logging.printf("CMFA: Ignoring %s on 0x9281 (not supported on this BMS)\n", tag);
     if (uds_state == UDS_NVROL_WRITE_9281) {
       start_sleep("NVROL");
     }
@@ -689,6 +698,7 @@ void CmfaEvBattery::sequence_step_rejected(const char* tag) {
 
 void CmfaEvBattery::abort_sequence(const char* reason) {
   bool was_nvrol = (uds_state >= UDS_NVROL_EXT_SESSION_1 && uds_state <= UDS_NVROL_WRITE_9281);
+  logging.printf("CMFA: UDS sequence aborted (%s) at state=%u\n", reason, (unsigned)uds_state);
   if (was_nvrol) {
     last_nvrol_status = String(reason) + " at step " + String((int)uds_state);
   }
@@ -703,12 +713,14 @@ void CmfaEvBattery::begin_sleep(const char* label, unsigned long silent_duration
   sleep_requested = true;
   bms_seen_silent_in_sleep = false;
   last_nvrol_status = String(label) + ": waiting for current <= 1A";
+  logging.printf("CMFA: %s requested -> waiting for current to drop (I=%ddA)\n", label, (int)pack_current_dA());
 }
 
 void CmfaEvBattery::end_sleep() {
   if (sleep_phase == SLEEP_AWAKE) {
     return;
   }
+  logging.printf("CMFA: Wake requested by user -> resuming CAN\n");
   finish_sleep();
   last_nvrol_status = "Woken by user at " + String(millis() / 1000) + "s";
 }
@@ -717,6 +729,7 @@ void CmfaEvBattery::continue_sleep(unsigned long now) {
   bool bms_quiet = (now - last_rx_ms) >= BMS_SILENT_THRESHOLD_MS;
   if (bms_quiet && !bms_seen_silent_in_sleep) {
     bms_seen_silent_in_sleep = true;
+    logging.printf("CMFA: BMS went silent %lus into sleep\n", (now - sleep_phase_started_ms) / 1000);
     last_nvrol_status = "BMS silent at +" + String((now - sleep_phase_started_ms) / 1000) + "s";
   }
 }
@@ -731,6 +744,7 @@ void CmfaEvBattery::finish_sleep() {
   uds_wait_done = true;
   const char* bms_note = bms_seen_silent_in_sleep ? " (BMS went silent)" : " (BMS NEVER went silent)";
   last_nvrol_status = "Completed at " + String(millis() / 1000) + "s" + bms_note;
+  logging.printf("CMFA: BMS sleep window finished%s, resuming CAN\n", bms_note);
 }
 
 void CmfaEvBattery::transmit_can(unsigned long currentMillis) {
@@ -743,6 +757,7 @@ void CmfaEvBattery::transmit_can(unsigned long currentMillis) {
         sleep_phase = SLEEP_SHUTDOWN;
         sleep_phase_started_ms = currentMillis;
         last_nvrol_status = "Shutting down (0.9s 0x44 sequence)";
+        logging.printf("CMFA: Current settled (I=%ddA) -> sending 0.9s shutdown sequence\n", (int)cur_dA);
       }
     } else {
       sleep_low_current_since_ms = 0;
@@ -750,6 +765,7 @@ void CmfaEvBattery::transmit_can(unsigned long currentMillis) {
         sleep_phase = SLEEP_AWAKE;
         sleep_requested = false;
         last_nvrol_status = "Aborted: current still " + String(cur_dA) + "dA after 30s";
+        logging.printf("CMFA: Sleep aborted, current still %ddA after 30s\n", (int)cur_dA);
       }
     }
   }
@@ -758,7 +774,13 @@ void CmfaEvBattery::transmit_can(unsigned long currentMillis) {
     if ((currentMillis - sleep_phase_started_ms) >= CMFA_SLEEP_SHUTDOWN_MS) {
       sleep_phase = SLEEP_SILENT;
       sleep_phase_started_ms = currentMillis;
-      last_nvrol_status = (sleep_silent_duration_ms == 0) ? "Asleep (press Wake to resume)" : "Sleeping (30s silent)";
+      if (sleep_silent_duration_ms == 0) {
+        last_nvrol_status = "Asleep (press Wake to resume)";
+        logging.printf("CMFA: Shutdown sequence complete -> bus silent until Wake\n");
+      } else {
+        last_nvrol_status = "Sleeping (30s silent)";
+        logging.printf("CMFA: Shutdown sequence complete -> bus silent for %lus\n", sleep_silent_duration_ms / 1000);
+      }
       return;
     }
     if ((currentMillis - previousMillis10) >= INTERVAL_10_MS) {
