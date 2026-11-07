@@ -125,7 +125,7 @@ class CmfaEvBattery : public CanBattery {
   uint16_t max_cell_voltage = 3700;
   uint16_t min_cell_voltage = 3700;
   uint16_t sum_of_cell_voltages = 0;
-  uint16_tinstant_current_raw_pad = 0;
+  uint16_t instant_current_raw_pad = 0;
   uint16_t instant_current_raw = 32767;
   uint16_t averaged_current_raw = 32640;
   uint32_t max_regen_power = 0;
