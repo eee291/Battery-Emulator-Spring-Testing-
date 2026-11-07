@@ -1,701 +1,944 @@
-#include "CMP-SMART-CAR-BATTERY.h"
+#include "CMFA-EV-BATTERY.h"
 #include <Arduino.h>
+#include <cstring>
 #include "../communication/can/comm_can.h"
 #include "../datalayer/datalayer.h"
 #include "../devboard/utils/common_functions.h"
 #include "../devboard/utils/events.h"
+#include "../devboard/utils/logging.h"
 
-void CmpSmartCarBattery::update_values() {
-  if (datalayer.system.info.equipment_stop_active == true) {
-    digitalWrite(esp32hal->WUP_PIN1(), LOW);   // Turn off wakeup pin
-  } else if (millis64() > INTERVAL_1_S) {      // millis64: plain millis() wraps after 49.7 days
-    digitalWrite(esp32hal->WUP_PIN1(), HIGH);  // Wake up the battery
+uint32_t CmfaEvBattery::rescale_raw_SOC(uint32_t raw_SOC) {
+  if (raw_SOC > 9500) {
+    raw_SOC = 9500;
+  }
+  if (raw_SOC < 500) {
+    raw_SOC = 500;
+  }
+  return ((raw_SOC - 500) * 10) / 9;
+}
+
+void CmfaEvBattery::update_values() {
+  datalayer.battery.status.soh_pptt = soh_average;
+  datalayer.battery.status.real_soc = soc_u;
+  datalayer.battery.status.voltage_dV = (pack_voltage / 10);
+  datalayer.battery.status.current_dA = pack_current_dA();
+
+  datalayer.battery.status.remaining_capacity_Wh = static_cast<uint32_t>(
+      (static_cast<double>(datalayer.battery.status.real_soc) / 10000) * datalayer.battery.info.total_capacity_Wh);
+
+  if (use_uds_power_limits) {
+    datalayer.battery.status.max_discharge_power_W = max_discharge_power;
+    datalayer.battery.status.max_charge_power_W = max_charge_power;
+  } else {
+    datalayer.battery.status.max_discharge_power_W =
+        datalayer.battery.status.override_discharge_power_W
+            ? datalayer.battery.status.override_discharge_power_W
+            : estimate_max_discharge_power_W(datalayer.battery.status.real_soc, minimum_temperature,
+                                             datalayer.battery.status.voltage_dV, max_cell_voltage);
+    datalayer.battery.status.max_charge_power_W =
+        datalayer.battery.status.override_charge_power_W
+            ? datalayer.battery.status.override_charge_power_W
+            : estimate_max_charge_power_W(datalayer.battery.status.real_soc, minimum_temperature,
+                                          datalayer.battery.status.voltage_dV, max_cell_voltage);
   }
 
-  datalayer_battery->status.real_soc = battery_soc * 10;
+  memcpy(datalayer.battery.status.cell_voltages_mV, cell_voltages, NUMBER_OF_CELLS * sizeof(uint16_t));
+  datalayer.battery.status.cell_min_voltage_mV = min_cell_voltage;
+  datalayer.battery.status.cell_max_voltage_mV = max_cell_voltage;
+  datalayer.battery.status.temperature_min_dC = minimum_temperature;
+  datalayer.battery.status.temperature_max_dC = maximum_temperature;
+  datalayer.battery.status.total_charged_battery_Wh = cumulative_energy_when_charging;
+  datalayer.battery.status.total_discharged_battery_Wh = cumulative_energy_when_discharging;
 
-  datalayer_battery->status.soh_pptt = SOH_estimated * 100;
-
-  datalayer_battery->status.voltage_dV = battery_voltage;
-
-  datalayer_battery->status.current_dA = battery_current_dA;
-
-  datalayer_battery->status.active_power_W =  //Power in watts, Negative = charging batt
-      ((datalayer_battery->status.voltage_dV * datalayer_battery->status.current_dA) / 100);
-
-  datalayer_battery->info.total_capacity_Wh = total_energy_when_full_Wh;
-
-  datalayer_battery->status.remaining_capacity_Wh = static_cast<uint32_t>(
-      (static_cast<double>(datalayer_battery->status.real_soc) / 10000) * datalayer_battery->info.total_capacity_Wh);
-
-  datalayer_battery->status.max_charge_power_W = regen_charge_cont_power * 100;
-
-  datalayer_battery->status.max_discharge_power_W = discharge_cont_available_power * 100;
-
-  if ((battery_temperature_minimum != 0) && (battery_temperature_maximum != 0)) {
-    //Only update once both values are available
-    datalayer_battery->status.temperature_min_dC = battery_temperature_minimum * 10;
-    datalayer_battery->status.temperature_max_dC = battery_temperature_maximum * 10;
-  }
-
-  datalayer_battery->status.cell_min_voltage_mV = min_cell_voltage;
-
-  datalayer_battery->status.cell_max_voltage_mV = max_cell_voltage;
-
-  if (number_of_cells > 0) {
-    datalayer_battery->info.number_of_cells = number_of_cells;
-  }
-
-  datalayer_battery->status.total_discharged_battery_Wh = lifetime_kWh_discharged;
-
-  datalayer_battery->status.total_charged_battery_Wh = lifetime_kWh_charged;
-
-  if (thermal_runaway == 0x01) {
-    set_event(EVENT_THERMAL_RUNAWAY, 0);
+  if (lv_bat_mv < 11000) {
+    set_event(EVENT_12V_LOW, lv_bat_mv);
   }
 }
 
-template <typename T>
-inline String& operator<<(String& str, const T& value) {
-  str += value;
-  return str;
+static uint32_t bal_mAh(uint16_t raw) {
+  return (uint32_t)raw * 25 / 18;
+}
+static uint32_t bal_s(uint16_t raw) {
+  return (uint32_t)raw * 10;
 }
 
-inline const char* getContactorStates(int index) {
-  switch (index) {
-    case 0:
-      return "Open";
-    case 1:
-      return "Closed";
-    case 2:
-      return "STUCK Open!";
-    case 3:
-      return "STUCK Closed!";
-    default:
-      return "";
-  }
-}
-
-String CmpSmartCarBattery::get_uds_info_html() {
+String CmfaEvBattery::get_uds_info_html() {
   String content;
-  content.reserve(1800);
-
-  // clang-format off
-  content << "<h4>Balancing active: " << (battery_balancing_active ? "Yes" : "No") << "</h4>"
-             "<h4>Positive contactor: "   << getContactorStates(battery_positive_contactor_state)  << "</h4>"
-             "<h4>Negative contactor: "   << getContactorStates(battery_negative_contactor_state)  << "</h4>"
-             "<h4>Precharge contactor: "  << getContactorStates(battery_precharge_contactor_state) << "</h4>"
-             "<h4>Wakeup reason: "        << hvbat_wakeup_state << "</h4>";
-
-  static const char* batteryStates[] = {
-    "Sleep", "Initialization", "Wait", "Ready", "Preheat",
-    "Discharge", "Charge", "Fault", "Pre-shutdown", "Shutdown",
-    "Cooling", "HV battery precondition"
+  content.reserve(3072);
+  auto fmt_bal = [](const char* label, uint16_t cur, uint16_t init, uint32_t (*conv)(uint16_t), const char* unit) {
+    String s = "<h4>";
+    s += label;
+    s += ": ";
+    if (cur == BAL_UNSET) {
+      s += "not read yet";
+    } else {
+      s += String(conv(cur)) + unit + " (was " + String(conv(init)) + unit + ")";
+    }
+    s += "</h4>";
+    return s;
   };
-  uint8_t bstate = battery_state;
-  content << "<h4>Battery state: " << (bstate < 12 ? batteryStates[bstate] : "Unknown") << "</h4>";
-
-  static const char* eplugStates[]   = { "Seated OK", "Disconnected!", "Open Status", "Invalid" };
-  static const char* hvilStates[]    = { "Closed OK", "OPEN!!", "Error", "Invalid" };
-  static const char* evWarnStates[]  = { "OK No alarm", "Blinking!!", "ON!!", "Invalid" };
-  static const char* chargeStates[]  = { "Not initiated", "In progress", "Completed", "Failure", "Stopped", "Forbidden", "Prohibited, suggest preheat or precondition" };
-  static const char* insulFault[]    = { "OK", "Symmetrical failure!!", "Asymmetric failure HV+!!", "Asymmetric failure HV-!!" };
-  static const char* insulCircuit[]  = { "Inactive (Insulation function not enabled)", "Active (Insulation function enabled)", "FAULT!!", "Insulation measurement in progress" };
-
-  uint8_t ep  = eplug_status;
-  uint8_t hv  = HVIL_status;
-  uint8_t ew  = ev_warning;
-  uint8_t cs  = battery_charging_status;
-  uint8_t ins = insulation_fault;
-  uint8_t irc = insulation_circuit_status;
-
-  content << "<h4>Battery fault level: " << battery_fault  << "</h4>"
-             "<h4>Eplug status: "         << (ep  < 4 ? eplugStates[ep]   : "Unknown") << "</h4>"
-             "<h4>HVIL status: "          << (hv  < 4 ? hvilStates[hv]    : "Unknown") << "</h4>"
-             "<h4>EV Warning: "           << (ew  < 4 ? evWarnStates[ew]  : "Unknown") << "</h4>"
-             "<h4>Authorised for usage: " << (power_auth ? "NOT authorised" : "Authorised OK") << "</h4>"
-             "<h4>Charging status: "      << (cs  < 7 ? chargeStates[cs]  : "Unknown") << "</h4>"
-             "<h4>Insulation status: "    << (ins < 4 ? insulFault[ins]   : "Unknown") << "</h4>"
-             "<h4>Insulation circuit status: " << (irc < 4 ? insulCircuit[irc] : "Unknown") << "</h4>";
-
-  // Hardware fault (bitmask)
-  uint8_t hw = hardware_fault_status;
-  content << "<h4>Hardware fault status: ";
-  if (hw == 0)        content << "No Fault";
-  if (hw & 0b001)     content << "FAULT! Temperature sensor! ";
-  if (hw & 0b010)     content << "FAULT! Voltage sensing circuit! ";
-  if (hw & 0b100)     content << "FAULT! Current sensor! ";
-  content << "</h4>";
-
-  // L3 fault (bitmask)
-  uint8_t l3 = l3_fault;
-  content << "<h4>L3 Fault: ";
-  if (l3 == 0)        content << "No Fault";
-  if (l3 & 0b000001) content << "Cell undervoltage ";
-  if (l3 & 0b000010) content << "Cell overvoltage ";
-  if (l3 & 0b000100) content << "Over temperature ";
-  if (l3 & 0b001000) content << "Under temperature ";
-  if (l3 & 0b010000) content << "Over discharge current ";
-  if (l3 & 0b100000) content << "Pack undervoltage ";
-  content << "</h4>";
-
-  // Plausibility error (bitmask)
-  uint8_t pe = plausibility_error;
-  content << "<h4>Plausibility error: ";
-  if (pe == 0)        content << "No error";
-  if (pe & 0b0001)   content << "Module temperature plausibility error ";
-  if (pe & 0b0010)   content << "Cell voltage plausibility error ";
-  if (pe & 0b0100)   content << "Battery voltage plausibility error ";
-  if (pe & 0b1000)   content << "HVBAT current plausibility error ";
-  content << "</h4>";
-
-  // Alerts (bitmask, two frames)
-  uint8_t a3 = alert_frame3;
-  uint8_t a4 = alert_frame4;
-  if (a3 || a4) {
-    content << "<h4>ALERT!!! ";
-    if (a3 & 0b00000001) content << "Cell Undervoltage ";
-    if (a3 & 0b00000010) content << "Cell Overvoltage ";
-    if (a3 & 0b00000100) content << "High SOC ";
-    if (a3 & 0b00001000) content << "Low SOC ";
-    if (a3 & 0b00010000) content << "Overvoltage ";
-    if (a3 & 0b00100000) content << "High temperature ";
-    if (a3 & 0b01000000) content << "Temperature Delta ";
-    if (a3 & 0b10000000) content << "Battery ";
-    if (a4 & 0b00010000) content << "Contactor Opening ";
-    if (a4 & 0b00100000) content << "Overcharge ";
-    if (a4 & 0b01000000) content << "Cell poor consistency ";
-    if (a4 & 0b10000000) content << "SOC jump ";
-    content << "</h4>";
+  content += "<h4>SOC U: " + String(soc_u / 100) + "percent</h4>";
+  content += "<h4>SOC Z: " + String(soc_z / 100) + "percent</h4>";
+  content += "<h4>SOH Average: " + String(soh_average) + "pptt</h4>";
+  content += "<h4>Instant current: " + String(((int32_t)instant_current_raw - 32767) * 250) + "mA</h4>";
+  content += "<h4>Average current: " + String((((int32_t)averaged_current_raw - 32640) * 125) / 4) + "mA</h4>";
+  content += "<h4>12V voltage: " + String(lv_bat_mv) + "mV</h4>";
+  content += "<h4>Highest cell number: " + String(highest_cell_number) + "</h4>";
+  content += "<h4>Lowest cell number: " + String(lowest_cell_number) + "</h4>";
+  content += "<h4>Sum of cellvoltages: " + String(sum_of_cell_voltages) + "dV</h4>";
+  content += "<h4>Max regen power: " + String(max_regen_power) + "W</h4>";
+  content += "<h4>Max discharge power: " + String(max_discharge_power) + "W</h4>";
+  content += "<h4>Max charge power: " + String(max_charge_power) + "W</h4>";
+  content += "<h4>Power limit source: " +
+             String(use_uds_power_limits ? "UDS (pack-reported)" : "ESTIMATED (user setting)") + "</h4>";
+  content += "<h4>Broadcast charge power limit (0x3D6): " + String(broadcast_charge_power_w) + "W</h4>";
+  content += "<h4>Broadcast discharge power limit (0x3D6): " + String(broadcast_discharge_power_w) + "W</h4>";
+  content += "<h4>Broadcast charge power request (0x127): " + String(broadcast_127_charge_power_w) + "W</h4>";
+  content += "<h4>Car state sent: " +
+             String(car_mode == CAR_MODE_CHARGING ? "CHARGING (as a real car)" : "DRIVING / IDLE (active EVC)") +
+             "</h4>";
+  {
+    char hex[8];
+    snprintf(hex, sizeof(hex), "0x%02X", broadcast_3D7_mode_byte);
+    const char* mode_str = "OTHER";
+    if (broadcast_3D7_mode_byte == 0x24) {
+      mode_str = "IDLE";
+    } else if (broadcast_3D7_mode_byte == 0x36) {
+      mode_str = "CHARGING";
+    }
+    content += "<h4>Pack mode (0x3D7 byte 0): " + String(mode_str) + " (" + String(hex) + ")</h4>";
   }
-
-  content << "<h4>RCD line active: " << (rcd_line_active ? "Yes" : "No") << "</h4>";
-
-  uint16_t dtc = active_DTC_code;
-  content << "<h4>Active DTC Code: " << dtc;
-  if (dtc == 9) content << " Temperature sensor missing between pin 21-22";
-  content << "</h4>";
-  // clang-format on
-
+  {
+    char hex[8];
+    snprintf(hex, sizeof(hex), "0x%02X", broadcast_43C_byte0);
+    bool idle_flag = (broadcast_43C_byte0 & 0x40) != 0;
+    content +=
+        "<h4>Pack idle flag (0x43C byte 0 bit 6): " + String(idle_flag ? "IDLE" : "CLEAR") + " (" + String(hex) + ")</h4>";
+  }
+  content += "<h4>BMS mode (DID 0x901E): " + String(bms_state) + "</h4>";
+  content += "<h4>Request from CAN (DID 0x901F): " + String(request_from_can) + "</h4>";
+  content += "<h4>End of charge flag (DID 0x9019): " + String(end_of_charge_flag ? "SET" : "CLEAR") + "</h4>";
+  content += "<h4>SOH available power: " + String(soh_available_power) + "</h4>";
+  content += "<h4>SOH generated power: " + String(soh_generated_power) + "</h4>";
+  content += "<h4>Average temperature: " + String(average_temperature) + "dC</h4>";
+  content += "<h4>Maximum temperature: " + String(maximum_temperature) + "dC</h4>";
+  content += "<h4>Minimum temperature: " + String(minimum_temperature) + "dC</h4>";
+  content += "<h4>Cumulative energy discharged: " + String(cumulative_energy_when_discharging) + "Wh</h4>";
+  content += "<h4>Cumulative energy charged: " + String(cumulative_energy_when_charging) + "Wh</h4>";
+  content += "<h4>Cumulative energy regen: " + String(cumulative_energy_in_regen) + "Wh</h4>";
+  content += fmt_bal("Balance capacity total", bal_cap_total_raw, initial_bal_cap_total_raw, bal_mAh, "mAh");
+  content += fmt_bal("Balance time total", bal_time_total_raw, initial_bal_time_total_raw, bal_s, "s");
+  content += fmt_bal("Balance capacity sleep", bal_cap_sleep_raw, initial_bal_cap_sleep_raw, bal_mAh, "mAh");
+  content += fmt_bal("Balance time sleep", bal_time_sleep_raw, initial_bal_time_sleep_raw, bal_s, "s");
+  content += fmt_bal("Balance capacity wake", bal_cap_wake_raw, initial_bal_cap_wake_raw, bal_mAh, "mAh");
+  content += fmt_bal("Balance time wake", bal_time_wake_raw, initial_bal_time_wake_raw, bal_s, "s");
+  String temp_str = (temporisation_flag == 0xFF)
+                        ? "UNKNOWN"
+                        : (temporisation_flag == 1 ? "ENABLED (1)" : ("DISABLED (" + String(temporisation_flag) + ")"));
+  content += "<h4>Temporisation: " + temp_str + "</h4>";
+  content += "<h4>Pack time life: " + String(pack_time_life) + "m (was " + String((int32_t)initial_pack_time_life) +
+             "m)</h4>";
+  content += "<h4>Absolute time saved: " + String(absolute_time_saved) + "m (was " +
+             String((int32_t)initial_absolute_time_saved) + "m)</h4>";
+  content += "<h4>Vehicle time sent (0x3D4): " +
+             (vehicle_time_valid ? (String(vehicle_time_sent) + "m") : String("not yet (waiting for pack times)")) +
+             "</h4>";
+  {
+    String sleep_str;
+    unsigned long now_ms = millis();
+    bool bms_quiet = (now_ms - last_rx_ms) >= BMS_SILENT_THRESHOLD_MS;
+    const char* bms_state_str =
+        bms_quiet ? "BMS SILENT" : (bms_seen_silent_in_sleep ? "BMS WOKE SELF" : "BMS STILL TRANSMITTING");
+    if (sleep_phase == SLEEP_STOPPING) {
+      unsigned long elapsed_s = (now_ms - sleep_phase_started_ms) / 1000;
+      sleep_str = "STOPPING CURRENT (" + String(elapsed_s) + "s, I=" + String(pack_current_dA()) + "dA)";
+    } else if (sleep_phase == SLEEP_SHUTDOWN) {
+      sleep_str = "SHUTTING DOWN (0.9s 0x44 sequence)";
+    } else if (sleep_phase == SLEEP_SILENT) {
+      unsigned long elapsed = now_ms - sleep_phase_started_ms;
+      if (sleep_silent_duration_ms == 0) {
+        sleep_str = "ASLEEP (Sleep button) for " + String(elapsed / 60000) + "m, " + bms_state_str;
+      } else {
+        unsigned long rem_s =
+            (elapsed < sleep_silent_duration_ms) ? ((sleep_silent_duration_ms - elapsed) / 1000) : 0;
+        sleep_str = "SLEEPING (" + String(rem_s) + "s left, " + bms_state_str + ")";
+      }
+    } else {
+      sleep_str = "AWAKE";
+    }
+    content += "<h4>Sleep: " + sleep_str + "</h4>";
+  }
+  content += "<h4>Last NVROL/sleep sequence: " + last_nvrol_status + "</h4>";
+  append_mission_html(content);
   return content;
 }
 
-bool checksum_OK(CAN_frame& rx_frame, uint8_t magic_byte) {
-  // Sum all data nibbles from bytes 0-6 (excluding last byte)
-  uint8_t sum = 0;
-
-  for (int i = 0; i < 7; i++) {
-    sum += (rx_frame.data.u8[i] >> 4);
-    sum += (rx_frame.data.u8[i] & 0x0F);
-  }
-
-  // Get counter from last byte low nibble
-  uint8_t counter = (rx_frame.data.u8[7] & 0x0F);
-
-  // Get checksum from last byte high nibble
-  uint8_t checksum = (rx_frame.data.u8[7] >> 4);
-
-  // Calculate expected checksum: (magic_byte - sum - counter) mod 16
-  int16_t expected = (magic_byte - (sum & 0x0F) - counter) % 16;
-  if (expected < 0) {
-    expected += 16;  // Ensure positive modulo result
-  }
-
-  return (checksum == expected);
-}
-
-uint8_t calculate_checksum(CAN_frame& rx_frame, uint8_t magic_byte) {
-  // Sum all data nibbles from bytes 0-6 (excluding last byte)
-  uint8_t sum = 0;
-
-  for (int i = 0; i < 7; i++) {
-    sum += (rx_frame.data.u8[i] >> 4);
-    sum += (rx_frame.data.u8[i] & 0x0F);
-  }
-
-  // Get counter from last byte low nibble
-  uint8_t counter = (rx_frame.data.u8[7] & 0x0F);
-
-  // Calculate expected checksum: (magic_byte - sum - counter) mod 16
-  int16_t calculated_checksum = (magic_byte - (sum & 0x0F) - counter) % 16;
-  if (calculated_checksum < 0) {
-    calculated_checksum += 16;  // Ensure positive modulo result
-  }
-
-  return calculated_checksum;
-}
-
-uint8_t calculate_checksum432(CAN_frame& rx_frame) {
-  // Sum all data nibbles from bytes 0-6 (excluding last byte)
-  uint8_t sum = 0;
-  uint8_t magic_byte = 6;
-
-  sum += (rx_frame.data.u8[0] >> 4);
-  sum += (rx_frame.data.u8[0] & 0x0F);
-  sum += (rx_frame.data.u8[1] >> 4);
-
-  for (int i = 3; i < 8; i++) {
-    sum += (rx_frame.data.u8[i] >> 4);
-    sum += (rx_frame.data.u8[i] & 0x0F);
-  }
-
-  // Get counter from last byte low nibble
-  uint8_t counter = (rx_frame.data.u8[2] & 0x0F);
-
-  // Calculate expected checksum: (magic_byte - sum - counter) mod 16
-  int16_t calculated_checksum = (magic_byte - (sum & 0x0F) - counter) % 16;
-  if (calculated_checksum < 0) {
-    calculated_checksum += 16;  // Ensure positive modulo result
-  }
-
-  return calculated_checksum;
-}
-
-void CmpSmartCarBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
-  // UDS frames (0x6B4 PID/DTC replies) are handled by the superclass.
-  if (handle_incoming_uds_can_frame(rx_frame)) {
-    return;
-  }
+void CmfaEvBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
+  last_rx_ms = millis();
   switch (rx_frame.ID) {
-    case 0x205:  //10ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      if (!checksum_OK(rx_frame, 0x18)) {
-        datalayer_battery->status.CAN_error_counter++;
-        break;  //Message checksum incorrect, abort reading data from it
-      }
-      battery_current_dA = -sign_extend_to_int16(((rx_frame.data.u8[0] << 7) | (rx_frame.data.u8[1] >> 1)), 15);
-      battery_soc = ((rx_frame.data.u8[2] & 0x1F) << 5) | (rx_frame.data.u8[3] >> 3);
-      battery_voltage =
-          ((((rx_frame.data.u8[3] & 0x07) << 10) | (rx_frame.data.u8[4] << 2) | (rx_frame.data.u8[5] >> 6)));
-      battery_state = ((rx_frame.data.u8[1] & 0x01) | (rx_frame.data.u8[2] >> 5));
-      battery_fault = ((rx_frame.data.u8[5] & 0x01) | (rx_frame.data.u8[6] >> 5));
-      battery_negative_contactor_state = ((rx_frame.data.u8[5] & 0x06) >> 1);
-      battery_positive_contactor_state = ((rx_frame.data.u8[5] & 0x18) >> 3);
-      battery_precharge_contactor_state = ((rx_frame.data.u8[5] & 0x20) >> 5);
-      battery_connect_status = (rx_frame.data.u8[6] & 0x03);
-      battery_charging_status = ((rx_frame.data.u8[6] & 0x1C) >> 5);
-      //counter_205 = (rx_frame.data.u8[7] & 0x0F);
+    case 0x127: {
+      datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;
+      uint8_t raw = (rx_frame.data.u8[0] >> 2) & 0x3F;
+      broadcast_127_charge_power_w = (uint16_t)raw * 300;
       break;
-    case 0x235:  //10ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      discharge_available_10s_power = ((rx_frame.data.u8[0] << 4) | (rx_frame.data.u8[1] >> 4));  //*0.1kW
-      discharge_available_10s_current =
-          (((rx_frame.data.u8[1] & 0x0F) << 9) | (rx_frame.data.u8[2] << 1) | (rx_frame.data.u8[3] >> 7));  //*0.1A
+    }
+    case 0x3D6:
+      datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;
+      broadcast_charge_power_w = (uint16_t)rx_frame.data.u8[2] * 500;
+      broadcast_discharge_power_w = (uint16_t)rx_frame.data.u8[3] * 500;
       break;
-    case 0x275:  //20ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      if (!checksum_OK(rx_frame, 0x01)) {
-        datalayer_battery->status.CAN_error_counter++;
-        break;  //Message checksum incorrect, abort reading data from it
-      }
-      discharge_cont_available_power = ((rx_frame.data.u8[0] << 3) | (rx_frame.data.u8[1] >> 5));      //*0.1kW
-      discharge_cont_available_current = (((rx_frame.data.u8[1] & 0x1F) << 8) | rx_frame.data.u8[2]);  //*0.1A
-      discharge_available_30s_current = ((rx_frame.data.u8[3] << 5) | (rx_frame.data.u8[4] >> 3));     //*0.1A
-      discharge_available_30s_power = (((rx_frame.data.u8[4] & 0x07) << 8) | rx_frame.data.u8[5]);     //*0.1kW
-      //counter_275 = (rx_frame.data.u8[7] & 0x0F);
+    case 0x3D7:
+      datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;
+      broadcast_3D7_mode_byte = rx_frame.data.u8[0];
       break;
-    case 0x285:  //20ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      if (!checksum_OK(rx_frame, 0x00)) {
-        datalayer_battery->status.CAN_error_counter++;
-        break;  //Message checksum incorrect, abort reading data from it
-      }
-      regen_charge_cont_power = ((rx_frame.data.u8[0] << 4) | (rx_frame.data.u8[1] >> 4));      //*0.1kW
-      regen_charge_30s_power = (((rx_frame.data.u8[1] & 0x0F) << 8) | rx_frame.data.u8[2]);     //*0.1kW
-      regen_charge_30s_current = ((rx_frame.data.u8[3] << 5) | (rx_frame.data.u8[4] >> 3));     //*0.1A
-      regen_charge_cont_current = (((rx_frame.data.u8[4] & 0x07) << 8) | rx_frame.data.u8[5]);  //*0.1A
-      //counter_285 = (rx_frame.data.u8[7] & 0x0F);
+    case 0x3D8:
+      datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;
       break;
-    case 0x2A5:  //100ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      battery_quickcharge_connect_status = rx_frame.data.u8[0] >> 6;
-      regen_charge_10s_current = (((rx_frame.data.u8[0] & 0x3F) << 1) | (rx_frame.data.u8[1] >> 1));  //*0.1a
-      regen_charge_10s_power = ((rx_frame.data.u8[2] << 4) | (rx_frame.data.u8[3] >> 4));             //*0.1kW
-      quick_charge_port_voltage = ((rx_frame.data.u8[4] << 4) | (rx_frame.data.u8[5] >> 4));          //*0.1kW
-      //qc_negative_contactor_status = rx_frame.data.u8[6] & 0x03;
-      //qc_positive_contactor_status = (rx_frame.data.u8[6] & 0x0C) >> 2;
-      //counter_2A5 = (rx_frame.data.u8[7] & 0x0F);
+    case 0x43C:
+      datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;
+      broadcast_43C_byte0 = rx_frame.data.u8[0];
       break;
-    case 0x325:  //100ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      if (!checksum_OK(rx_frame, 0x05)) {
-        datalayer_battery->status.CAN_error_counter++;
-        break;  //Message checksum incorrect, abort reading data from it
-      }
-      battery_balancing_active = rx_frame.data.u8[0] & 0x01;
-      eplug_status = (rx_frame.data.u8[0] & 0x06) >> 1;  //0 connected, 1 disconnected, 2 open status, 3 invalid
-      ev_warning = (rx_frame.data.u8[0] & 0x18) >> 3;
-      power_auth = (rx_frame.data.u8[0] & 0x20) >> 5;
-      HVIL_status = (rx_frame.data.u8[0] & 0xC0) >> 6;
-      hardware_fault_status = (rx_frame.data.u8[1] & 0x1C) >> 2;
-      insulation_fault = (rx_frame.data.u8[1] & 0xE0) >> 5;
-      temperature = (((rx_frame.data.u8[1] & 0x03) << 7) | (rx_frame.data.u8[2] >> 1));  //*0.1kW
-      service_due = rx_frame.data.u8[3] & 0x03;
-      plausibility_error = (rx_frame.data.u8[3] & 0x3C) >> 2;
-      insulation_circuit_status = (rx_frame.data.u8[3] & 0xC0) >> 6;
-      l3_fault = rx_frame.data.u8[4] & 0x3F;
-      master_warning = (rx_frame.data.u8[4] & 0xC0) >> 6;
-      insulation_resistance_kOhm = ((rx_frame.data.u8[5] << 8) | (rx_frame.data.u8[6]));
-      datalayer_battery->status.insulation_resistance_kOhm = insulation_resistance_kOhm;
-      datalayer_battery->status.insulation_resistance_available = true;
-      //counter_325 = (rx_frame.data.u8[7] & 0x0F);
+    case 0x5A9:
+    case 0x5AB:
+    case 0x5C8:
+    case 0x5E1:
+      datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;
       break;
-    case 0x334:  // Cellvoltages
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      mux = (rx_frame.data.u8[0] >> 3);  // Mux goes from 0-25
+    case 0x7BB: {
+      datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;
 
-      if (mux < 25) {  // Only process valid cell data frames (0-24) (100S, but protocol does support 108S)
-        uint8_t base_index = mux * 4;
+      if (uds_state != UDS_IDLE) {
+        if (uds_state == UDS_DTC_READ) {
+          if ((rx_frame.data.u8[0] & 0xF0) == 0x10) {
+            transmit_can_frame(&CMFA_ACK);
+          }
+          if (uds_try_parse_dtc_ReadDTCByStatusMask_rx(&rx_frame, CMFA_UDS_RESP_ID)) {
+            uds_state = UDS_IDLE;
+          }
+          break;
+        }
+        if (uds_state == UDS_DTC_CLEAR) {
+          if (uds_check_ClearDiagnosticInformation_rx(&rx_frame, CMFA_UDS_RESP_ID)) {
+            uds_dtc_clear_Complete();
+            uds_state = UDS_IDLE;
+          }
+          break;
+        }
+        uint8_t pci_len = rx_frame.data.u8[0];
+        uint8_t sid = rx_frame.data.u8[1];
+        if (pci_len >= 2 && sid == 0x7F) {
+          char tag[16];
+          snprintf(tag, sizeof(tag), "NRC 0x%02X", rx_frame.data.u8[3]);
+          sequence_step_rejected(tag);
+          break;
+        }
+        on_uds_sequence_step();
+        break;
+      }
 
-        datalayer_battery->status.cell_voltages_mV[base_index + 0] =
-            ((rx_frame.data.u8[1] << 4) | (rx_frame.data.u8[2] >> 4)) * 4;
-        datalayer_battery->status.cell_voltages_mV[base_index + 1] =
-            ((rx_frame.data.u8[3] & 0xFF) << 4) | (rx_frame.data.u8[4] >> 4);
-        datalayer_battery->status.cell_voltages_mV[base_index + 2] =
-            (((rx_frame.data.u8[4] & 0x0F) << 8) | (rx_frame.data.u8[5])) * 4;
-        datalayer_battery->status.cell_voltages_mV[base_index + 3] =
-            ((rx_frame.data.u8[6] & 0x0F) << 8) | rx_frame.data.u8[7];
+      if (rx_frame.data.u8[0] == 0x10) {
+        transmit_can_frame(&CMFA_ACK);
       }
-      break;
-    case 0x335:  //100ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      //checksum_335 //Init value 0xB
-      DC_bus_voltage = ((rx_frame.data.u8[0] << 5) | (rx_frame.data.u8[1] >> 3));
-      charge_max_voltage =
-          (((rx_frame.data.u8[1] & 0x07) << 10) | (rx_frame.data.u8[2] << 2) | (rx_frame.data.u8[3] >> 6));
-      charge_cont_curr_max = (((rx_frame.data.u8[3] & 0x3F) << 7) | (rx_frame.data.u8[4] >> 1));
-      charge_cont_curr_req =
-          (((rx_frame.data.u8[4] & 0x01) << 12) | (rx_frame.data.u8[5] << 4) | (rx_frame.data.u8[6] >> 4));
-      //counter_335 = (rx_frame.data.u8[7] & 0x0F);
-      break;
-    case 0x385:  //1000ms Wakeup state message
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      hvbat_wakeup_state = rx_frame.data.u8[0];
-      break;
-    case 0x3F4:  //Event triggered
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      mux = (rx_frame.data.u8[0] >> 5);
-      //This message contains all individual temperature sensors. Not needed fofr us
-      break;
-    case 0x434:  //1000ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      hours_spent_overvoltage = ((rx_frame.data.u8[0] << 5) | (rx_frame.data.u8[1] >> 3)) / 10;
-      hours_spent_overtemperature =
-          (((rx_frame.data.u8[1] & 0x07) << 10) | (rx_frame.data.u8[2] << 2) | (rx_frame.data.u8[3] >> 6)) / 10;
-      hours_spent_undertemperature = (((rx_frame.data.u8[3] & 0x3F) << 7) | (rx_frame.data.u8[4] >> 1)) / 10;
-      total_coloumb_counting_Ah =
-          (((rx_frame.data.u8[4] & 0x01) << 11) | (rx_frame.data.u8[5] << 3) | (rx_frame.data.u8[6] >> 5)) * 125;
-      total_coulomb_counting_kWh = (((rx_frame.data.u8[6] & 0x1F) << 7) | (rx_frame.data.u8[7] >> 1)) * 35;
-      break;
-    case 0x435:  //500ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      tempval = rx_frame.data.u8[0] - 40;
-      if (tempval < 210) {
-        battery_temperature_maximum = rx_frame.data.u8[0] - 40;
-      }
-      temp = ((rx_frame.data.u8[2] << 6) | (rx_frame.data.u8[3] >> 2));
-      if ((temp > 2000) && (temp < 4500)) {
-        min_cell_voltage = temp;
-      }
-      min_cell_voltage_number = rx_frame.data.u8[4];
-      temp = ((rx_frame.data.u8[5] << 6) | (rx_frame.data.u8[6] >> 2));
-      if ((temp > 2000) && (temp < 4500)) {
-        max_cell_voltage = temp;
-      }
-      max_cell_voltage_number = rx_frame.data.u8[7];
-      break;
-    case 0x455:  //100ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      nominal_voltage = ((rx_frame.data.u8[0] << 5) | (rx_frame.data.u8[1] >> 3));
-      charge_continue_power_limit =
-          (((rx_frame.data.u8[1] & 0x07) << 9) | (rx_frame.data.u8[2] << 1) | (rx_frame.data.u8[3] >> 7));
-      charge_energy_amount_requested = (((rx_frame.data.u8[3] & 0x7F) << 5) | (rx_frame.data.u8[4] >> 3));
-      bulk_SOC_DC_limit = rx_frame.data.u8[6] >> 1;
-      break;
-    case 0x485:  //Non-periodic
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      //heating_contactor_operating_count = ((rx_frame.data.u8[6] << 8) | (rx_frame.data.u8[7]))
-      break;
-    case 0x494:  //1000ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      //total_coloumb_counting_Ah
-      lifetime_kWh_charged = (((rx_frame.data.u8[1] & 0x0F) << 8) | rx_frame.data.u8[2]) * 35;
-      lifetime_kWh_discharged = ((rx_frame.data.u8[3] << 4) | (rx_frame.data.u8[4] >> 4)) * 35;
-      hours_spent_exceeding_charge_power = (((rx_frame.data.u8[4] & 0x0F) << 8) | rx_frame.data.u8[5]);
-      hours_spent_exceeding_discharge_power = (((rx_frame.data.u8[4] & 0x7F) << 5) | (rx_frame.data.u8[7] >> 3));
-      break;
-    case 0x535:  //1000ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      SOC_actual = ((rx_frame.data.u8[0] << 2) | (rx_frame.data.u8[1] >> 6));
-      alert_low_battery_energy = rx_frame.data.u8[1] & 0x01;
-      battery_temperature_average = rx_frame.data.u8[4] - 40;
-      battery_minimum_voltage_reached_warning = rx_frame.data.u8[7] & 0x01;
-      break;
-    case 0x543:  //1000ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      remaining_energy_Wh = ((rx_frame.data.u8[0] << 3) | (rx_frame.data.u8[1] >> 5)) * 32;
-      total_energy_when_full_Wh = ((rx_frame.data.u8[2] << 3) | (rx_frame.data.u8[3] >> 5)) * 32;
-      SOH_internal_resistance = (((rx_frame.data.u8[3] & 0x1F) << 2) | (rx_frame.data.u8[4] >> 6));
-      SOH_estimated = (rx_frame.data.u8[5] >> 1);
-      break;
-    case 0x575:
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      break;
-    case 0x583:  //1000ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      max_temperature_probe_number = rx_frame.data.u8[0];
-      min_temperature_probe_number = rx_frame.data.u8[1];
 
-      alert_frame3 = rx_frame.data.u8[3];
-      alert_frame4 = rx_frame.data.u8[4];
-
-      tempval = rx_frame.data.u8[2] - 40;
-      if (tempval < 210) {
-        battery_temperature_minimum = rx_frame.data.u8[2] - 40;
-      }
-      if (rx_frame.data.u8[5] < 200) {
-        number_of_temperature_sensors = rx_frame.data.u8[5];
-      }
-      if (rx_frame.data.u8[6] < 200) {
-        number_of_cells = rx_frame.data.u8[6];
+      if (uds_fast_ingest_response(&rx_frame, CMFA_UDS_RESP_ID)) {
+        const UdsRxBuffer& buf = uds_fast_buffer();
+        if (buf.len >= 3 && buf.data[0] == 0x62) {
+          uint16_t pid = ((uint16_t)buf.data[1] << 8) | buf.data[2];
+          handle_pid(pid, &buf.data[3], buf.len - 3);
+        }
+        uds_wait_done = true;
+      } else if (rx_frame.data.u8[0] <= 0x07 && rx_frame.data.u8[1] == 0x7F) {
+        uds_wait_done = true;
       }
       break;
-    case 0x595:  //1000ms - Time to charge to 20/40/680/100 , not needed for integration
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      break;
-    case 0x5B5:  //100ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      heater_relay_status = rx_frame.data.u8[0] & 0x03;
-      preheating_status = (rx_frame.data.u8[0] & 0x0C) >> 3;
-      cooling_enabled = (rx_frame.data.u8[0] & 0x10) >> 4;
-      coolant_temperature_warning = (rx_frame.data.u8[0] & 0x60) >> 5;
-      coolant_alarm = (rx_frame.data.u8[0] & 0x80) >> 7;
-      coolant_temperature = rx_frame.data.u8[1] - 40;
-      thermal_control = (rx_frame.data.u8[2] & 0x70) >> 4;
-      thermal_runaway = (rx_frame.data.u8[6] & 0xC0) >> 6;
-      thermal_runaway_module_ID = (rx_frame.data.u8[6] & 0x1C) >> 2;
-      break;
-    case 0x615:
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      break;
-    case 0x625:
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      break;
-    case 0x665:  //1000ms
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      main_contactor_cycle_count = ((rx_frame.data.u8[0] << 2) | (rx_frame.data.u8[1] >> 6)) * 200;
-      QC_contactor_cycle_count = (((rx_frame.data.u8[1] & 0x3F) << 4) | (rx_frame.data.u8[2] >> 4)) * 200;
-      break;
-    case 0x675:
-      //battery_remaining_capacity_Ah = //0.001 signal, 20 bit long, byte 5 bit 7 start pos
-      break;
-    case 0x694:  // Poll reply
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      break;
-    case 0x795:
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      rcd_line_active = (rx_frame.data.u8[0] & 0x40) >> 6;
-      break;
-    case 0x7B5:
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      active_DTC_code = rx_frame.data.u8[2];
-      break;
+    }
     default:
       break;
   }
 }
 
-uint16_t CmpSmartCarBattery::handle_pid(uint16_t pid, uint32_t value, const uint8_t* data, uint16_t length) {
-  // Called by the UDS superclass for every successful PID response. `value` is
-  // the big-endian PID value (up to 4 bytes), `data` points at the raw value
-  // bytes (without the SID/DID header). Return 0 to continue the scan list.
-  switch (pid) {
-      //case PID_CONTACTOR_CLOSING_COUNTER:
-      //break;
-    default:  //Unknown pid
+static void decode_balance_word(uint16_t val, uint16_t& cur, uint16_t& init, const char* name, uint32_t (*conv)(uint16_t),
+                                const char* unit) {
+  if (init == 0xFFFF) {
+    init = val;
+    logging.printf("CMFA: %s initial = %lu%s (raw %u)\n", name, (unsigned long)conv(val), unit, val);
+  } else if (val != cur) {
+    logging.printf("CMFA: %s changed %lu%s -> %lu%s (delta %+ld%s, from initial %+ld%s)\n", name,
+                   (unsigned long)conv(cur), unit, (unsigned long)conv(val), unit,
+                   (long)conv(val) - (long)conv(cur), unit, (long)conv(val) - (long)conv(init), unit);
+  }
+  cur = val;
+}
+
+void CmfaEvBattery::handle_pid(uint16_t poll_pid, const uint8_t* data, uint8_t length) {
+  if (length == 0) {
+    return;
+  }
+  uint16_t value = (length >= 2) ? (((uint16_t)data[0] << 8) | data[1]) : data[0];
+  uint32_t value32 = (length >= 4) ? (((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+                                      ((uint32_t)data[2] << 8) | (uint32_t)data[3])
+                                   : value;
+  switch (poll_pid) {
+    case PID_POLL_SOC_Z:
+      soc_z = (length == 1) ? ((uint32_t)data[0] * 50) : rescale_raw_SOC(value);
+      break;
+    case PID_POLL_SOC_U:
+      soc_u = (length == 1) ? ((uint32_t)data[0] * 50) : rescale_raw_SOC(value);
+      break;
+    case PID_POLL_SOH_AVERAGE:
+      soh_average = (length == 1) ? ((uint16_t)data[0] * 50) : value;
+      break;
+    case PID_POLL_PACK_VOLTAGE:
+      pack_voltage = value;
+      break;
+    case PID_POLL_AVERAGE_VOLTAGE_OF_CELLS:
+      sum_of_cell_voltages = (uint16_t)(((uint32_t)value * 10) / 128);
+      break;
+    case PID_POLL_MAX_CELL_VOLTAGE:
+      max_cell_voltage = (value * 9765) / 10000;
+      break;
+    case PID_POLL_CELL_NUMBER_HIGHEST_VOLTAGE:
+      highest_cell_number = value;
+      break;
+    case PID_POLL_MIN_CELL_VOLTAGE:
+      min_cell_voltage = (value * 9765) / 10000;
+      break;
+    case PID_POLL_CELL_NUMBER_LOWEST_VOLTAGE:
+      lowest_cell_number = value;
+      break;
+    case PID_POLL_INSTANT_CURRENT:
+      instant_current_raw = value;
+      break;
+    case PID_POLL_100MS_CURRENT:
+      averaged_current_raw = value;
+      break;
+    case PID_POLL_MAXIMUM_GENERATED_POWER:
+      max_regen_power = value * 250;
+      break;
+    case PID_POLL_AVAILABLE_POWER:
+      max_discharge_power = value * 250;
+      break;
+    case PID_POLL_LV_BAT:
+      lv_bat_mv = (value * 9765) / 10000;
+      break;
+    case PID_POLL_AVERAGE_TEMPERATURE:
+      average_temperature = (length == 1) ? (((int16_t)data[0] - 40) * 10) : (int16_t)(((int32_t)value - 400) / 2);
+      break;
+    case PID_POLL_MIN_TEMPERATURE:
+      minimum_temperature = (length == 1) ? (((int16_t)data[0] - 40) * 10) : (int16_t)(((int32_t)value - 400) / 2);
+      break;
+    case PID_POLL_MAX_TEMPERATURE:
+      maximum_temperature = (length == 1) ? (((int16_t)data[0] - 40) * 10) : (int16_t)(((int32_t)value - 400) / 2);
+      break;
+    case PID_POLL_MAXIMUM_CHARGE_POWER:
+      max_charge_power = value * 250;
+      break;
+    case PID_POLL_END_OF_CHARGE_FLAG:
+      end_of_charge_flag = (uint8_t)value;
+      break;
+    case PID_POLL_HVBATT_INTERLOCK_FLAG:
+      interlock_flag = (uint8_t)value;
+      break;
+    case PID_POLL_CUMULATIVE_ENERGY_WHEN_CHARGING:
+      cumulative_energy_when_charging = value32;
+      break;
+    case PID_POLL_CUMULATIVE_ENERGY_WHEN_DISCHARGING:
+      cumulative_energy_when_discharging = value32;
+      break;
+    case PID_POLL_CUMULATIVE_ENERGY_IN_REGEN:
+      cumulative_energy_in_regen = value32;
+      break;
+    case PID_POLL_SOH_AVAILABLE_POWER:
+      soh_available_power = value;
+      break;
+    case PID_POLL_SOH_GENERATED_POWER:
+      soh_generated_power = value;
+      break;
+    case PID_POLL_BALANCE_CAPACITY_TOTAL:
+      decode_balance_word(value, bal_cap_total_raw, initial_bal_cap_total_raw, "Balance capacity total", bal_mAh,
+                          "mAh");
+      break;
+    case PID_POLL_BALANCE_TIME_TOTAL:
+      decode_balance_word(value, bal_time_total_raw, initial_bal_time_total_raw, "Balance time total", bal_s, "s");
+      break;
+    case PID_POLL_BALANCE_CAPACITY_SLEEP:
+      decode_balance_word(value, bal_cap_sleep_raw, initial_bal_cap_sleep_raw, "Balance capacity sleep", bal_mAh,
+                          "mAh");
+      break;
+    case PID_POLL_BALANCE_TIME_SLEEP:
+      decode_balance_word(value, bal_time_sleep_raw, initial_bal_time_sleep_raw, "Balance time sleep", bal_s, "s");
+      break;
+    case PID_POLL_BALANCE_CAPACITY_WAKE:
+      decode_balance_word(value, bal_cap_wake_raw, initial_bal_cap_wake_raw, "Balance capacity wake", bal_mAh, "mAh");
+      break;
+    case PID_POLL_BALANCE_TIME_WAKE:
+      decode_balance_word(value, bal_time_wake_raw, initial_bal_time_wake_raw, "Balance time wake", bal_s, "s");
+      break;
+    case PID_POLL_TEMPORISATION:
+      if (temporisation_flag != (uint8_t)value) {
+        logging.printf("CMFA: Temporisation flag = %u\n", (unsigned)value);
+      }
+      temporisation_flag = (uint8_t)value;
+      break;
+    case PID_POLL_PACK_TIME_LIFE: {
+      uint32_t v = (length >= 3) ? (((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | data[2]) : value;
+      if (initial_pack_time_life == UINT32_MAX) {
+        initial_pack_time_life = v;
+      } else if (v != pack_time_life) {
+        log_pack_time_change("Pack time life", pack_time_life, v);
+      }
+      pack_time_life = v;
+      update_vehicle_time_from_pack();
+      break;
+    }
+    case PID_POLL_ABSOLUTE_TIME_SAVED: {
+      uint32_t v = (length >= 3) ? (((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | data[2]) : value;
+      if (initial_absolute_time_saved == UINT32_MAX) {
+        initial_absolute_time_saved = v;
+      } else if (v != absolute_time_saved) {
+        log_pack_time_change("Absolute time saved", absolute_time_saved, v);
+      }
+      absolute_time_saved = v;
+      update_vehicle_time_from_pack();
+      break;
+    }
+    case PID_POLL_BMS_STATE:
+      bms_state = (uint8_t)value;
+      break;
+    case PID_POLL_REQUEST_FROM_CAN:
+      request_from_can = (uint8_t)value;
+      break;
+
+    case PID_POLL_CELL_1:
+    case PID_POLL_CELL_2:
+    case PID_POLL_CELL_3:
+    case PID_POLL_CELL_4:
+    case PID_POLL_CELL_5:
+    case PID_POLL_CELL_6:
+    case PID_POLL_CELL_7:
+    case PID_POLL_CELL_8:
+    case PID_POLL_CELL_9:
+    case PID_POLL_CELL_10:
+    case PID_POLL_CELL_11:
+    case PID_POLL_CELL_12:
+    case PID_POLL_CELL_13:
+    case PID_POLL_CELL_14:
+    case PID_POLL_CELL_15:
+    case PID_POLL_CELL_16:
+    case PID_POLL_CELL_17:
+    case PID_POLL_CELL_18:
+    case PID_POLL_CELL_19:
+    case PID_POLL_CELL_20:
+    case PID_POLL_CELL_21:
+    case PID_POLL_CELL_22:
+    case PID_POLL_CELL_23:
+    case PID_POLL_CELL_24:
+    case PID_POLL_CELL_25:
+    case PID_POLL_CELL_26:
+    case PID_POLL_CELL_27:
+    case PID_POLL_CELL_28:
+    case PID_POLL_CELL_29:
+    case PID_POLL_CELL_30:
+    case PID_POLL_CELL_31:
+      cell_voltages[poll_pid - PID_POLL_CELL_1] = (value * 9765) / 10000;
+      break;
+    case PID_POLL_CELL_32:
+    case PID_POLL_CELL_33:
+    case PID_POLL_CELL_34:
+    case PID_POLL_CELL_35:
+    case PID_POLL_CELL_36:
+    case PID_POLL_CELL_37:
+    case PID_POLL_CELL_38:
+    case PID_POLL_CELL_39:
+    case PID_POLL_CELL_40:
+    case PID_POLL_CELL_41:
+    case PID_POLL_CELL_42:
+    case PID_POLL_CELL_43:
+    case PID_POLL_CELL_44:
+    case PID_POLL_CELL_45:
+    case PID_POLL_CELL_46:
+    case PID_POLL_CELL_47:
+    case PID_POLL_CELL_48:
+    case PID_POLL_CELL_49:
+    case PID_POLL_CELL_50:
+    case PID_POLL_CELL_51:
+    case PID_POLL_CELL_52:
+    case PID_POLL_CELL_53:
+    case PID_POLL_CELL_54:
+    case PID_POLL_CELL_55:
+    case PID_POLL_CELL_56:
+    case PID_POLL_CELL_57:
+    case PID_POLL_CELL_58:
+    case PID_POLL_CELL_59:
+    case PID_POLL_CELL_60:
+    case PID_POLL_CELL_61:
+    case PID_POLL_CELL_62:
+      cell_voltages[poll_pid - PID_POLL_CELL_1 - 1] = (value * 9765) / 10000;
+      break;
+    case PID_POLL_CELL_63:
+    case PID_POLL_CELL_64:
+    case PID_POLL_CELL_65:
+    case PID_POLL_CELL_66:
+    case PID_POLL_CELL_67:
+    case PID_POLL_CELL_68:
+    case PID_POLL_CELL_69:
+    case PID_POLL_CELL_70:
+    case PID_POLL_CELL_71:
+    case PID_POLL_CELL_72:
+      cell_voltages[poll_pid - PID_POLL_CELL_1 - 2] = (value * 9765) / 10000;
+      break;
+    default:
+      if (poll_pid >= PID_POLL_MISSION_FIRST && poll_pid <= PID_POLL_MISSION_LAST) {
+        handle_mission_pid(poll_pid, data, length);
+      }
       break;
   }
-  return 0;  //Continue scanning the PID list in order
 }
 
-void CmpSmartCarBattery::transmit_can(unsigned long currentMillis) {
+void CmfaEvBattery::update_vehicle_time_from_pack() {
+  uint32_t base_pack_life = (initial_pack_time_life != UINT32_MAX) ? initial_pack_time_life : 0;
+  uint32_t base_abs_time = (initial_absolute_time_saved != UINT32_MAX) ? initial_absolute_time_saved : 113502;
 
-  // Send periodic CAN Messages simulating the car still being attached
-  // Send 10ms messages
-  if (currentMillis - previousMillis10 >= INTERVAL_10_MS) {
+  uint32_t delta_min = (initial_pack_time_life != UINT32_MAX && pack_time_life > base_pack_life)
+                           ? (pack_time_life - base_pack_life)
+                           : (uint32_t)(millis() / 60000UL);
+
+  uint32_t t1 = CMFA_VEHICLE_TIME_1_OFFSET + base_abs_time + delta_min;
+  uint32_t t2 = base_abs_time + delta_min + 1;
+
+  CMFA_3D4.data.u8[0] = (uint8_t)((t1 >> 16) & 0xFF);
+  CMFA_3D4.data.u8[1] = (uint8_t)((t1 >> 8) & 0xFF);
+  CMFA_3D4.data.u8[2] = (uint8_t)(t1 & 0xFF);
+  CMFA_3D4.data.u8[3] = (uint8_t)((t2 >> 16) & 0xFF);
+  CMFA_3D4.data.u8[4] = (uint8_t)((t2 >> 8) & 0xFF);
+  CMFA_3D4.data.u8[5] = (uint8_t)(t2 & 0xFF);
+
+  vehicle_time_sent = t2;
+  vehicle_time_valid = true;
+}
+
+void CmfaEvBattery::log_pack_time_change(const char* name, uint32_t prev, uint32_t now) {
+  logging.printf("CMFA: %s changed %lum -> %lum (delta %+ldm)\n", name, (unsigned long)prev, (unsigned long)now,
+                 (long)now - (long)prev);
+}
+
+void CmfaEvBattery::handle_mission_pid(uint16_t poll_pid, const uint8_t* data, uint8_t length) {
+  uint8_t block_idx = (uint8_t)(poll_pid - PID_POLL_MISSION_FIRST);
+  if (block_idx >= MISSION_BLOCK_COUNT) {
+    return;
+  }
+  uint8_t n_entries = length / 8;
+  if (n_entries > MISSION_ENTRIES_PER_BLOCK) {
+    n_entries = MISSION_ENTRIES_PER_BLOCK;
+  }
+  bool first_time_block = (mission_blocks_seen_mask & (1u << block_idx)) == 0;
+  for (uint8_t i = 0; i < n_entries; i++) {
+    const uint8_t* p = &data[i * 8];
+    bool all_zero = true, all_ff = true;
+    for (int b = 0; b < 8; b++) {
+      if (p[b] != 0x00) all_zero = false;
+      if (p[b] != 0xFF) all_ff = false;
+    }
+    MissionEntry e;
+    memcpy(e.raw, p, 8);
+    e.valid = !(all_zero || all_ff);
+    e.t_end = (int8_t)p[0];
+    e.t_init = (int8_t)p[1];
+    e.soc_end = p[2];
+    e.soc_init = p[3];
+    e.mode_flags = p[4];
+    e.charge_ah = p[5];
+    e.discharge_ah = (uint8_t)(p[6] >> 2);
+    e.duration_min = (uint16_t)(((p[6] & 0x03) << 8) | p[7]);
+
+    uint8_t slot = block_idx * MISSION_ENTRIES_PER_BLOCK + i;
+    MissionEntry& prev = mission_initial[slot];
+    if (first_time_block || memcmp(prev.raw, e.raw, 8) != 0) {
+      prev = e;
+      if (e.valid) {
+        mission_ring[mission_ring_head] = e;
+        mission_ring_head = (mission_ring_head + 1) % MISSION_RING_SIZE;
+        if (mission_ring_count < MISSION_RING_SIZE) {
+          mission_ring_count++;
+        }
+      }
+    }
+  }
+  mission_blocks_seen_mask |= (1u << block_idx);
+}
+
+void CmfaEvBattery::append_mission_html(String& content) {
+  if (mission_blocks_seen_mask == 0) {
+    content += "<h4>Mission log: not read yet</h4>";
+    return;
+  }
+  content += "<h4>Mission log (" + String(mission_ring_count) + " recent entries):</h4>";
+  if (mission_ring_count == 0) {
+    return;
+  }
+  content += "<pre style='font-size:11px'>";
+  content += " #  Mode  Dur(m) SOC i->f  T i->f  +Ah -Ah  Raw\n";
+  for (uint8_t k = 0; k < mission_ring_count; k++) {
+    uint8_t idx = (mission_ring_head + MISSION_RING_SIZE - 1 - k) % MISSION_RING_SIZE;
+    const MissionEntry& e = mission_ring[idx];
+    char line[96];
+    snprintf(line, sizeof(line), "%2u  0x%02X  %5u  %3u->%-3u  %3d->%-3d %3u %3u  %02X%02X%02X%02X%02X%02X%02X%02X\n",
+             (unsigned)k, e.mode_flags, e.duration_min, e.soc_init, e.soc_end, (int)e.t_init, (int)e.t_end,
+             e.charge_ah, e.discharge_ah, e.raw[0], e.raw[1], e.raw[2], e.raw[3], e.raw[4], e.raw[5], e.raw[6],
+             e.raw[7]);
+    content += line;
+  }
+  content += "</pre>";
+}
+
+void CmfaEvBattery::update_car_state_frames() {
+  if (car_mode == CAR_MODE_CHARGING) {
+    charging_3D3_toggle = !charging_3D3_toggle;
+    CMFA_3D3.data.u8[0] = 0x47;
+    CMFA_3D3.data.u8[1] = 0x1F;
+    CMFA_3D3.data.u8[2] = 0x00;
+    CMFA_3D3.data.u8[3] = 0x02;
+    CMFA_3D3.data.u8[4] = charging_3D3_toggle ? 0x5D : 0xB2;
+    CMFA_3D3.data.u8[5] = 0x20;
+    CMFA_3D3.data.u8[6] = charging_3D3_toggle ? 0xB2 : 0x5D;
+    CMFA_3D3.data.u8[7] = 0xD9;
+    CMFA_3D4.data.u8[6] = 0x98;
+    CMFA_3D4.data.u8[7] = 0x22;
+    CMFA_3D5.data.u8[3] = 0x60;
+    uint8_t chg134[8] = {0x91, 0x8A, 0xD2, 0x3F, 0xC2, 0x4C, 0x80, 0x00};
+    memcpy(CMFA_134.data.u8, chg134, 8);
+  } else {
+    charging_3D3_toggle = !charging_3D3_toggle;
+    CMFA_3D3.data.u8[0] = 0x47;
+    CMFA_3D3.data.u8[1] = 0x1E;
+    CMFA_3D3.data.u8[2] = 0x00;
+    CMFA_3D3.data.u8[3] = 0x01;
+    CMFA_3D3.data.u8[4] = 0x5D;
+    CMFA_3D3.data.u8[5] = 0xA0;
+    CMFA_3D3.data.u8[6] = 0xB2;
+    CMFA_3D3.data.u8[7] = charging_3D3_toggle ? 0xDB : 0xDA;
+    CMFA_3D4.data.u8[6] = 0x80;
+    CMFA_3D4.data.u8[7] = 0x04;
+    CMFA_3D5.data.u8[3] = 0x00;
+    uint8_t drv134[8] = {0x05, 0x4A, 0xCC, 0x41, 0x62, 0x4C, 0x80, 0x00};
+    memcpy(CMFA_134.data.u8, drv134, 8);
+  }
+}
+
+void CmfaEvBattery::start_uds_sequence(CmfaUdsState first_step, const char* label) {
+  if (uds_state != UDS_IDLE) {
+    return;
+  }
+  uds_state = first_step;
+  uds_step_started_ms = millis();
+  transmit_can_frame(&CMFA_EXT_SESSION);
+  if (first_step == UDS_NVROL_EXT_SESSION_1) {
+    last_nvrol_status = "In progress: sent 10 03";
+  }
+}
+
+void CmfaEvBattery::on_uds_sequence_step() {
+  uds_step_started_ms = millis();
+  switch (uds_state) {
+    case UDS_TEMP_EXT_SESSION:
+      uds_state = UDS_TEMP_WRITE_9281;
+      transmit_can_frame(&CMFA_WRITE_9281);
+      break;
+    case UDS_TEMP_WRITE_9281:
+      uds_state = UDS_IDLE;
+      break;
+    case UDS_NVROL_EXT_SESSION_1:
+      uds_state = UDS_NVROL_ROUTINE_B009;
+      last_nvrol_status = "In progress: sent 31 01 B0 09";
+      transmit_can_frame(&CMFA_ROUTINE_B009);
+      break;
+    case UDS_NVROL_ROUTINE_B009:
+      uds_state = UDS_NVROL_EXT_SESSION_2;
+      last_nvrol_status = "In progress: sent second 10 03";
+      transmit_can_frame(&CMFA_EXT_SESSION);
+      break;
+    case UDS_NVROL_EXT_SESSION_2:
+      uds_state = UDS_NVROL_WRITE_9281;
+      last_nvrol_status = "In progress: sent 2E 92 81 01";
+      transmit_can_frame(&CMFA_WRITE_9281);
+      break;
+    case UDS_NVROL_WRITE_9281:
+      uds_state = UDS_IDLE;
+      start_sleep("NVROL");
+      break;
+    default:
+      uds_state = UDS_IDLE;
+      break;
+  }
+}
+
+void CmfaEvBattery::on_uds_sequence_timeout() {
+  abort_sequence("Timed out");
+}
+
+void CmfaEvBattery::sequence_step_rejected(const char* tag) {
+  if (uds_state == UDS_NVROL_WRITE_9281 || uds_state == UDS_TEMP_WRITE_9281) {
+    if (uds_state == UDS_NVROL_WRITE_9281) {
+      start_sleep("NVROL");
+    }
+    uds_state = UDS_IDLE;
+    return;
+  }
+  abort_sequence(tag);
+}
+
+void CmfaEvBattery::abort_sequence(const char* reason) {
+  bool was_nvrol = (uds_state >= UDS_NVROL_EXT_SESSION_1 && uds_state <= UDS_NVROL_WRITE_9281);
+  if (was_nvrol) {
+    last_nvrol_status = String(reason) + " at step " + String((int)uds_state);
+  }
+  uds_state = UDS_IDLE;
+}
+
+void CmfaEvBattery::begin_sleep(const char* label, unsigned long silent_duration_ms) {
+  sleep_phase = SLEEP_STOPPING;
+  sleep_phase_started_ms = millis();
+  sleep_low_current_since_ms = 0;
+  sleep_silent_duration_ms = silent_duration_ms;
+  sleep_requested = true;
+  bms_seen_silent_in_sleep = false;
+  last_nvrol_status = String(label) + ": waiting for current <= 1A";
+}
+
+void CmfaEvBattery::end_sleep() {
+  if (sleep_phase == SLEEP_AWAKE) {
+    return;
+  }
+  finish_sleep();
+  last_nvrol_status = "Woken by user at " + String(millis() / 1000) + "s";
+}
+
+void CmfaEvBattery::continue_sleep(unsigned long now) {
+  bool bms_quiet = (now - last_rx_ms) >= BMS_SILENT_THRESHOLD_MS;
+  if (bms_quiet && !bms_seen_silent_in_sleep) {
+    bms_seen_silent_in_sleep = true;
+    last_nvrol_status = "BMS silent at +" + String((now - sleep_phase_started_ms) / 1000) + "s";
+  }
+}
+
+void CmfaEvBattery::finish_sleep() {
+  sleep_phase = SLEEP_AWAKE;
+  sleep_requested = false;
+  previousMillis10 = 0;
+  previousMillis100 = 0;
+  previousMillis200 = 0;
+  previousMillis1000 = 0;
+  uds_wait_done = true;
+  const char* bms_note = bms_seen_silent_in_sleep ? " (BMS went silent)" : " (BMS NEVER went silent)";
+  last_nvrol_status = "Completed at " + String(millis() / 1000) + "s" + bms_note;
+}
+
+void CmfaEvBattery::transmit_can(unsigned long currentMillis) {
+  if (sleep_phase == SLEEP_STOPPING) {
+    int16_t cur_dA = pack_current_dA();
+    if (std::abs(cur_dA) <= CMFA_SLEEP_MAX_CURRENT_DA) {
+      if (sleep_low_current_since_ms == 0) {
+        sleep_low_current_since_ms = currentMillis;
+      } else if ((currentMillis - sleep_low_current_since_ms) >= CMFA_SLEEP_STOP_SETTLE_MS) {
+        sleep_phase = SLEEP_SHUTDOWN;
+        sleep_phase_started_ms = currentMillis;
+        last_nvrol_status = "Shutting down (0.9s 0x44 sequence)";
+      }
+    } else {
+      sleep_low_current_since_ms = 0;
+      if ((currentMillis - sleep_phase_started_ms) >= CMFA_SLEEP_MAX_WAIT_MS) {
+        sleep_phase = SLEEP_AWAKE;
+        sleep_requested = false;
+        last_nvrol_status = "Aborted: current still " + String(cur_dA) + "dA after 30s";
+      }
+    }
+  }
+
+  if (sleep_phase == SLEEP_SHUTDOWN) {
+    if ((currentMillis - sleep_phase_started_ms) >= CMFA_SLEEP_SHUTDOWN_MS) {
+      sleep_phase = SLEEP_SILENT;
+      sleep_phase_started_ms = currentMillis;
+      last_nvrol_status = (sleep_silent_duration_ms == 0) ? "Asleep (press Wake to resume)" : "Sleeping (30s silent)";
+      return;
+    }
+    if ((currentMillis - previousMillis10) >= INTERVAL_10_MS) {
+      previousMillis10 = currentMillis;
+      CMFA_135.data.u8[1] = ((CMFA_135.data.u8[1] + 0x50) & 0xF0) | 0x05;
+      transmit_can_frame(&CMFA_135);
+    }
+    if ((currentMillis - previousMillis100) >= INTERVAL_100_MS) {
+      previousMillis100 = currentMillis;
+      shutdown_3D3_toggle = !shutdown_3D3_toggle;
+      CMFA_3D3_SHUTDOWN.data.u8[4] = shutdown_3D3_toggle ? 0xB2 : 0x5D;
+      CMFA_3D3_SHUTDOWN.data.u8[6] = shutdown_3D3_toggle ? 0x5D : 0xB2;
+      transmit_can_frame(&CMFA_3D3_SHUTDOWN);
+      update_vehicle_time_from_pack();
+      transmit_can_frame(&CMFA_3D4);
+      transmit_can_frame(&CMFA_3D5_SHUTDOWN);
+    }
+    return;
+  }
+
+  if (sleep_phase == SLEEP_SILENT) {
+    if (sleep_silent_duration_ms > 0 && (currentMillis - sleep_phase_started_ms) >= sleep_silent_duration_ms) {
+      finish_sleep();
+    } else {
+      continue_sleep(currentMillis);
+      return;
+    }
+  }
+
+  if ((currentMillis - previousMillis10) >= INTERVAL_10_MS) {
     previousMillis10 = currentMillis;
-
-    if (startup_increment < 250) {
-      startup_increment++;
-    }
-
-    /*
-    counter_10ms = (counter_10ms + 1) % 16;  // counter_10ms repeats after 16 messages. 0-1..15-0
-
-    CMP_262.data.u8[0] =
-        0x00;  //0b0000 powertrain inactive, 0b0100 powertrain activation, 0b1000 powertrain active (Goes from E0, 00, 40 to 80 in logs). E0 all the time when CCS charging
-
-    CMP_208.data.u8[1] =
-        0x00;  //Goes from 00->20->3E in logs while starting to drive. TODO: Emulate? 00 while quickcharging
-    CMP_208.data.u8[5] = 0x23;  // Powertrain status, off, TODO: 20, 21, 22, 23, 24?
-    CMP_208.data.u8[7] = counter_10ms;
-    CMP_208.data.u8[7] = (calculate_checksum(CMP_208, 0x05) << 4) | counter_10ms;
-
-    CMP_217.data.u8[4] = checksum217[counter_10ms];
-
-    CMP_241.data.u8[2] = 0x39;  //Goes from 20-22-25-27-2A-2C-2F-31-34-36-39 on startup. TODO: Emulate?
-    //Highest bit in CMP_241[2] contains emergency shutdown request. 0b0 no emg stop, 0b1 emg stop requested.
-    CMP_241.data.u8[7] = counter_10ms;
-    CMP_241.data.u8[7] = (calculate_checksum(CMP_241, 0x08) << 4) | counter_10ms;
-
-    //transmit_can_frame(&CMP_208);
-    //transmit_can_frame(&CMP_217);
-    //transmit_can_frame(&CMP_241);
-    //transmit_can_frame(&CMP_262);
-    */
+    CMFA_135.data.u8[1] = ((CMFA_135.data.u8[1] + 0x50) & 0xF0) | 0x05;
+    CMFA_125.data.u8[3] = (CMFA_125.data.u8[3] + 5) & 0x0F;
+    transmit_can_frame(&CMFA_1EA);
+    transmit_can_frame(&CMFA_135);
+    transmit_can_frame(&CMFA_134);
+    transmit_can_frame(&CMFA_125);
   }
 
-  // Send 50ms messages
-  if (currentMillis - previousMillis50 >= INTERVAL_50_MS) {
-    previousMillis50 = currentMillis;
-    counter_50ms = (counter_50ms + 1) % 16;  // counter_50ms repeats after 16 messages. 0-1..15-0
-
-    /*
-    Is this reallly needed? Or can we jump straight to wakeup?
-    if (startup_counter_432 < 255) {
-      startup_counter_432++;
-    }
-    if (startup_counter_432 < 15) {
-      CMP_432.data.u8[0] = 0x60;  //Remote unlock, partial wakeup + No main wakeup
-      CMP_432.data.u8[4] = 0x04;
-    }
-    if (startup_counter_432 > 15) {
-      CMP_432.data.u8[0] = 0x70;  //Remote unlock, partial wakeup + No main wakeup + Anti theft wake
-    }
-    if (startup_counter_432 > 200) {
-      CMP_432.data.u8[0] = 0x80;  //Main wakeup
-      CMP_432.data.u8[4] = 0x00;
-    }
-  */
-    CMP_432.data.u8[0] = 0x80;  //Main wakeup
-    CMP_432.data.u8[2] = counter_50ms;
-    //CMP_432.data.u8[3] = 0x wakeup charging remote, preconditioning wakeup, VCU stop/start charge, long park partial wake
-    CMP_432.data.u8[1] = 0x20;  //1 no wish to start, 2 wish to start
-    CMP_432.data.u8[1] = 0x20 | calculate_checksum432(CMP_432);
-
-    //CMP_421.data.u8[3] = 0x20;  //Post wakeup , goes from 0x00 when car on, to 0x80 to when turning off car
-
-    transmit_can_frame(&CMP_432);  //Main wakeup
-    //transmit_can_frame(&CMP_421);  //Post wakeup (Apparently not needed for contactor closing?)
-  }
-
-  // Send 60ms messages
-  if (currentMillis - previousMillis60 >= INTERVAL_60_MS) {
-    previousMillis60 = currentMillis;
-    counter_60ms = (counter_60ms + 1) % 16;  // counter_60ms repeats after 16 messages. 0-1..15-0
-
-    if (startup_increment < 200) {  //During startup we request open contactors
-      CMP_351.data.u8[0] = 0xA6;
-      CMP_351.data.u8[1] = 0x10;
-      CMP_351.data.u8[2] = 0x10;
-    } else {  //Normal handling of 351 message according to we need to open/close contactors
-      if (datalayer.system.status.system_status == FAULT) {
-        //Open contactors
-        CMP_351.data.u8[0] = 0xA6;
-        CMP_351.data.u8[1] = 0x10;
-        CMP_351.data.u8[2] = 0x10;
-      } else {  //Close contactors
-        CMP_351.data.u8[0] = 0x46;
-        CMP_351.data.u8[1] = 0x14;
-        CMP_351.data.u8[2] = 0x17;
-      }
-    }
-
-    CMP_351.data.u8[7] = counter_60ms;
-    CMP_351.data.u8[7] = (calculate_checksum(CMP_351, 0x06) << 4) | counter_60ms;
-
-    transmit_can_frame(&CMP_351);  //Airbag
-  }
-
-  // Send 100ms messages
-  if (currentMillis - previousMillis100 >= INTERVAL_100_MS) {
+  if ((currentMillis - previousMillis100) >= INTERVAL_100_MS) {
     previousMillis100 = currentMillis;
-    counter_100ms = (counter_100ms + 1) % 16;  // counter_100ms repeats after 16 messages. 0-1..15-0
+    update_car_state_frames();
+    update_vehicle_time_from_pack();
 
-    CMP_211.data.u8[2] = 0x00;  //00 QC contactor OFF, 81, QC contactor ON
+    transmit_can_frame(&CMFA_59B);
+    transmit_can_frame(&CMFA_3D3);
+    transmit_can_frame(&CMFA_3D4);
+    transmit_can_frame(&CMFA_3D5);
+    transmit_can_frame(&CMFA_42B);
+    transmit_can_frame(&CMFA_431);
+    transmit_can_frame(&CMFA_442);
+    transmit_can_frame(&CMFA_443);
+    transmit_can_frame(&CMFA_511);
 
-    if (startup_increment < 200) {  //During startup we request open contactors
-      CMP_211.data.u8[4] = 0x17;    //Ready mode (unsure why this opens contactors)
-    } else {                        //Normal handling of close/open
-
-      if (datalayer.system.status.system_status == FAULT) {
-        //Open contactors
-        CMP_211.data.u8[4] = 0x17;  //Ready mode (unsure why this opens contactors) (Bit 1 is insulation turn-off)
-      } else {                      //Close contactors
-        CMP_211.data.u8[4] = 0x06;  //04 discharge (+bit1 insulation turn off), 4A charge
-      }
+    static uint8_t tick_1000ms = 0;
+    if (++tick_1000ms >= 10) {
+      tick_1000ms = 0;
+      transmit_can_frame(&CMFA_69F);
     }
 
-    CMP_211.data.u8[7] = counter_100ms;
-    CMP_211.data.u8[7] = (calculate_checksum(CMP_211, 0x0B) << 4) | counter_100ms;
-
-    //CMP_4A2.data.u8[1] = 0x40;  //00 plugged, 64 unplugged, 41vehiclerunning
-
-    transmit_can_frame(&CMP_211);
-    //transmit_can_frame(&CMP_231);  // Battery Preconditioning (Apparently not needed for contactor closing?)
-    //transmit_can_frame(&CMP_422);  // (Apparently not needed for contactor closing?)
-    //transmit_can_frame(&CMP_4A2);  //Should we send plugged in, or unplugged? (Apparently not needed for contactor closing?)
+    if (datalayer.battery.status.bms_status != FAULT) {
+      datalayer.system.status.battery_allows_contactor_closing = true;
+    } else {
+      datalayer.system.status.battery_allows_contactor_closing = false;
+    }
   }
 
-  // Send 1s messages
-  if (currentMillis - previousMillis1000 >= INTERVAL_1_S) {
-    previousMillis1000 = currentMillis;
-
-    /*
-    vehicle_time_counter = (vehicle_time_counter + 10);
-
-    CMP_552.data.u8[0] = ((vehicle_time_counter) & 0xFF000000) >> 24;
-    CMP_552.data.u8[1] = ((vehicle_time_counter) & 0x00FF0000) >> 16;
-    CMP_552.data.u8[2] = ((vehicle_time_counter) & 0x0000FF00) >> 8;
-    CMP_552.data.u8[3] = ((vehicle_time_counter) & 0x000000FF);
-
-    transmit_can_frame(&CMP_552);
-    //This message is odd. Non periodic, but increments 10 per cycle. Might be enough to send it once every second
-    */
+  if (uds_state != UDS_IDLE && (currentMillis - uds_step_started_ms) >= UDS_STEP_TIMEOUT_MS) {
+    if (uds_state == UDS_DTC_READ || uds_state == UDS_DTC_CLEAR) {
+      uds_state = UDS_IDLE;
+    } else {
+      on_uds_sequence_timeout();
+    }
   }
-  // UDS PID polling and DTC handling
-  transmit_uds_can(currentMillis);
+
+  if (uds_state == UDS_IDLE) {
+    if (uds_dtc_clear_CheckRequest()) {
+      CAN_frame req{};
+      if (uds_build_ClearDiagnosticInformation_tx(&req, CMFA_UDS_REQ_ID)) {
+        uds_state = UDS_DTC_CLEAR;
+        uds_step_started_ms = currentMillis;
+        transmit_can_frame(&req);
+      }
+    } else if (uds_dtc_request_CheckRequest()) {
+      CAN_frame req{};
+      if (uds_build_ReadDTCByStatusMask_tx(&req, CMFA_UDS_REQ_ID, 0xFF)) {
+        uds_state = UDS_DTC_READ;
+        uds_step_started_ms = currentMillis;
+        transmit_can_frame(&req);
+      }
+    }
+  }
+
+  if (uds_state == UDS_IDLE &&
+      (uds_wait_done || (currentMillis - previousMillis200) >= INTERVAL_200_MS) &&
+      (currentMillis - previousMillis200) >= INTERVAL_100_MS) {
+    previousMillis200 = currentMillis;
+    uds_wait_done = false;
+
+    int pid = 0;
+    if (fast_slot_counter < FAST_POLL_COUNT) {
+      pid = fast_poll_pids[fast_poll_index];
+      fast_poll_index = (fast_poll_index + 1) % FAST_POLL_COUNT;
+      fast_slot_counter++;
+    } else {
+      fast_slot_counter = 0;
+      if (slow_poll_pids.size() > 0) {
+        pid = slow_poll_pids.get(slow_poll_cursor);
+        slow_poll_cursor = (slow_poll_cursor + 1) % slow_poll_pids.size();
+      }
+    }
+    if (pid != 0) {
+      current_poll_pid = (uint16_t)pid;
+      CAN_frame req{};
+      if (uds_build_ReadDataByIdentifier_tx(&req, CMFA_UDS_REQ_ID, current_poll_pid)) {
+        req.data.u8[4] = 0x55;
+        req.data.u8[5] = 0x55;
+        req.data.u8[6] = 0x55;
+        req.data.u8[7] = 0x55;
+        uds_fast_start_request(CMFA_UDS_RESP_ID, 0x22);
+        transmit_can_frame(&req);
+      }
+    }
+  }
 }
 
-void CmpSmartCarBattery::setup(void) {  // Performs one time setup at startup
-  static bool pins_allocated = false;
-
-  // Only allocate pins once, double-battery uses same WUP pin
-  if (!pins_allocated) {
-    if (!esp32hal->alloc_pins(Name, esp32hal->WUP_PIN1())) {
-      return;  // Pin allocation failed
-    }
-    pinMode(esp32hal->WUP_PIN1(), OUTPUT);
-    digitalWrite(esp32hal->WUP_PIN1(), LOW);  // Set pin to low
-    pins_allocated = true;
-  }
-
+void CmfaEvBattery::setup(void) {
   strncpy(datalayer.system.info.battery_protocol, Name, 63);
   datalayer.system.info.battery_protocol[63] = '\0';
-  datalayer_battery->info.number_of_cells = 100;
-  datalayer_battery->info.chemistry = battery_chemistry_enum::LFP;
-  datalayer_battery->info.total_capacity_Wh = 41400;
-  datalayer_battery->info.max_cell_voltage_mV = MAX_CELL_VOLTAGE_MV;
-  datalayer_battery->info.min_cell_voltage_mV = MIN_CELL_VOLTAGE_MV;
-  datalayer_battery->info.max_cell_voltage_deviation_mV = MAX_CELL_DEVIATION_MV;
-  datalayer_battery->info.max_design_voltage_dV = MAX_PACK_VOLTAGE_100S_DV;
-  datalayer_battery->info.min_design_voltage_dV = MIN_PACK_VOLTAGE_100S_DV;
-  datalayer.system.status.battery_allows_contactor_closing = true;
+  datalayer.battery.info.number_of_cells = NUMBER_OF_CELLS;
+  datalayer.battery.info.max_cell_voltage_mV = MAX_CELL_VOLTAGE_MV;
+  datalayer.battery.info.min_cell_voltage_mV = MIN_CELL_VOLTAGE_MV;
+  datalayer.battery.info.max_cell_voltage_deviation_mV = MAX_CELL_DEVIATION_MV;
+  datalayer.battery.info.max_design_voltage_dV = MAX_PACK_VOLTAGE_DV;
+  datalayer.battery.info.min_design_voltage_dV = MIN_PACK_VOLTAGE_DV;
+  datalayer.battery.info.total_capacity_Wh = 26800;
+  datalayer.battery.info.chemistry = battery_chemistry_enum::NMC;
 
-  // UDS: send requests to 0x6B4, accept replies from the BMS on 0x694.
-  setup_uds(0x6B4, 0x694);
-  static const uint16_t pid_scan_list[] = {
-      //PID_WELD_CHECK,
+  const int initial_slow_pids[] = {
+      PID_POLL_PACK_TIME_LIFE,
+      PID_POLL_BMS_STATE,
+      PID_POLL_REQUEST_FROM_CAN,
+      PID_POLL_SOC_Z,
+      PID_POLL_SOC_U,
+      PID_POLL_SOH_AVERAGE,
+      PID_POLL_PACK_VOLTAGE,
+      PID_POLL_AVERAGE_VOLTAGE_OF_CELLS,
+      PID_POLL_MAX_CELL_VOLTAGE,
+      PID_POLL_CELL_NUMBER_HIGHEST_VOLTAGE,
+      PID_POLL_MIN_CELL_VOLTAGE,
+      PID_POLL_CELL_NUMBER_LOWEST_VOLTAGE,
+      PID_POLL_MAXIMUM_GENERATED_POWER,
+      PID_POLL_LV_BAT,
+      PID_POLL_AVERAGE_TEMPERATURE,
+      PID_POLL_MIN_TEMPERATURE,
+      PID_POLL_MAX_TEMPERATURE,
+      PID_POLL_END_OF_CHARGE_FLAG,
+      PID_POLL_HVBATT_INTERLOCK_FLAG,
+      PID_POLL_CUMULATIVE_ENERGY_WHEN_CHARGING,
+      PID_POLL_CUMULATIVE_ENERGY_WHEN_DISCHARGING,
+      PID_POLL_CELL_1,  PID_POLL_CELL_2,  PID_POLL_CELL_3,  PID_POLL_CELL_4,  PID_POLL_CELL_5,  PID_POLL_CELL_6,
+      PID_POLL_CELL_7,  PID_POLL_CELL_8,  PID_POLL_CELL_9,  PID_POLL_CELL_10, PID_POLL_CELL_11, PID_POLL_CELL_12,
+      PID_POLL_CELL_13, PID_POLL_CELL_14, PID_POLL_CELL_15, PID_POLL_CELL_16, PID_POLL_CELL_17, PID_POLL_CELL_18,
+      PID_POLL_CELL_19, PID_POLL_CELL_20, PID_POLL_CELL_21, PID_POLL_CELL_22, PID_POLL_CELL_23, PID_POLL_CELL_24,
+      PID_POLL_CELL_25, PID_POLL_CELL_26, PID_POLL_CELL_27, PID_POLL_CELL_28, PID_POLL_CELL_29, PID_POLL_CELL_30,
+      PID_POLL_CELL_31, PID_POLL_CELL_32, PID_POLL_CELL_33, PID_POLL_CELL_34, PID_POLL_CELL_35, PID_POLL_CELL_36,
+      PID_POLL_CELL_37, PID_POLL_CELL_38, PID_POLL_CELL_39, PID_POLL_CELL_40, PID_POLL_CELL_41, PID_POLL_CELL_42,
+      PID_POLL_CELL_43, PID_POLL_CELL_44, PID_POLL_CELL_45, PID_POLL_CELL_46, PID_POLL_CELL_47, PID_POLL_CELL_48,
+      PID_POLL_CELL_49, PID_POLL_CELL_50, PID_POLL_CELL_51, PID_POLL_CELL_52, PID_POLL_CELL_53, PID_POLL_CELL_54,
+      PID_POLL_CELL_55, PID_POLL_CELL_56, PID_POLL_CELL_57, PID_POLL_CELL_58, PID_POLL_CELL_59, PID_POLL_CELL_60,
+      PID_POLL_CELL_61, PID_POLL_CELL_62, PID_POLL_CELL_63, PID_POLL_CELL_64, PID_POLL_CELL_65, PID_POLL_CELL_66,
+      PID_POLL_CELL_67, PID_POLL_CELL_68, PID_POLL_CELL_69, PID_POLL_CELL_70, PID_POLL_CELL_71, PID_POLL_CELL_72,
+      PID_POLL_MISSION_FIRST + 0,
+      PID_POLL_MISSION_FIRST + 1,
+      PID_POLL_MISSION_FIRST + 2,
+      PID_POLL_MISSION_FIRST + 3,
   };
-  set_pid_scan_list(pid_scan_list, sizeof(pid_scan_list) / sizeof(pid_scan_list[0]));
+  slow_poll_pids.clear();
+  for (size_t i = 0; i < sizeof(initial_slow_pids) / sizeof(initial_slow_pids[0]); i++) {
+    slow_poll_pids.add(initial_slow_pids[i]);
+  }
+  update_vehicle_time_from_pack();
 }
